@@ -635,8 +635,8 @@ const PHASES=[
   g.text("B?",[5.4,.8],C.coral,tl,13);
   g.text("or B?",[-5.4,.8],C.coral,tl,13);
 }},
-/* 6 · stage 2: walk, re-measure, resolve */
-{cam:[2.5,.25,5.1], draw(g,t){
+/* 6 · stage 2: walk, re-measure, resolve — the busiest phase, so give it longer */
+{cam:[2.5,.25,5.1], dur:7000, draw(g,t){
   const f=1-win(t,0,.28);
   g.arrow([.5,0],[3.2,0],C.muted,.7*f,2.4);
   g.arrow([-.5,0],[-3.2,0],C.muted,.7*f,2.4);
@@ -763,8 +763,8 @@ function stageView(t){
 function renderStage(now){
   const ctx=stageCv.getContext("2d");
   ctx.clearRect(0,0,stageCv.width,stageCv.height);
-  const t=ease(clamp01((now-stageT0)/3400));
   const ph=PHASES[stagePhase];
+  const t=ease(clamp01((now-stageT0)/(ph.dur||3400)));
   ph.draw(kit(ctx,stageView(t),stageCv.width,stageCv.height), t, now);
 }
 
