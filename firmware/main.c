@@ -254,6 +254,19 @@ static void promisc_cb(void *buf, wifi_promiscuous_pkt_type_t type){
 #define FIND_CHAN 1
 static char my_ssid[20];
 
+static int   tri_stage = 0;      // 0 idle, 1 captured A1, 2 solved
+static float tri_walk = 0;       // baseline walked between captures, m
+static int   tri_steps = 0;
+
+/* forward decls: the ESP-NOW rx callback below handles triangulation control
+   messages, but the triangulation state lives further down the file. */
+#define MAXPEERAP 16
+typedef struct { uint8_t bssid[6]; int8_t rssi; } ap_ent_t;
+static ap_ent_t peer_aps[MAXPEERAP];
+static int peer_nap = 0;
+static volatile bool peer_scan_fresh = false;
+static volatile bool scan_req_pending = false;
+
 /* ---- ESP-NOW ranging: no 102 ms beacon floor, so we can sample at 50 Hz ---- */
 static uint8_t BCAST[6] = {0xff,0xff,0xff,0xff,0xff,0xff};
 static volatile int  now_rssi = -100;
@@ -263,6 +276,15 @@ static uint8_t peer_mac[6];
 static bool peer_known = false;
 
 static void now_rx(const esp_now_recv_info_t *i, const uint8_t *d, int len){
+    if(len >= 2 && d[0] == 0xA1){ scan_req_pending = true; return; }
+    if(len >= 2 && d[0] == 0xA2){
+        int n = d[1]; if(n > 16) n = 16;
+        if(len >= 2 + n*7){
+            memcpy(peer_aps, d+2, n*7);
+            peer_nap = n; peer_scan_fresh = true;
+        }
+        return;
+    }
     if(peer_known && memcmp(i->src_addr, peer_mac, 6) != 0) return;
     if(i->rx_ctrl) now_rssi = i->rx_ctrl->rssi;
     now_pkts++;
@@ -389,6 +411,7 @@ static bool  live_valid = false;
 
 static void step_detected(void){
     steps++;
+    if(tri_stage == 1){ tri_steps++; tri_walk += STEP_M; }
     walked += STEP_M;
     if(win_d0 < 0) win_d0 = dist_m;
     // Recompute over ~4 strides: long enough that the range change clears the
@@ -487,6 +510,101 @@ static void ble_init(void){
     // peripheral role, which we deliberately disabled. Broadcast-only
     // advertising carries the name in the adv fields instead.
     nimble_port_freertos_init(ble_host_task);
+}
+
+
+/* ================= AP TRIANGULATION =================
+   Two badges, plus the building's access points as shared reference points.
+
+   Frame: A1 at the origin, and the direction the user WALKS defines +x. That
+   is the whole trick -- with no compass we cannot know north, but the user can
+   always feel "straight ahead", so we solve in their walking frame and report
+   the answer as an angle off it.
+
+   Measurements per capture:
+     dAB   FTM range A->B
+     a_i   RSSI range A->AP i
+     b_i   RSSI range B->AP i   (B scans on request and replies over ESP-NOW)
+
+   A1, A2 and the two FTM ranges already pin B to two mirrored points. The APs
+   do not add a new capability -- they over-determine the system, so a single
+   bad range stops dominating. See the honest note on reflection below. */
+
+typedef struct { uint8_t type; uint8_t n; ap_ent_t e[MAXPEERAP]; } scanmsg_t;
+#define MSG_SCAN_REQ  0xA1
+#define MSG_SCAN_RESP 0xA2
+
+// our own scans at the two capture points
+static ap_ent_t capA[2][MAXPEERAP]; static int capA_n[2] = {0,0};
+static float capA_dab[2] = {-1,-1};
+static float tri_angle = -1, tri_quality = -1;
+static int tri_common = 0;
+static const char *tri_msg = "A: capture point 1";
+
+static float rssi_range(int rssi){        // shared path-loss model
+    return powf(10.0f, (RSSI_AT_1M - (float)rssi) / (10.0f * PATHLOSS_N));
+}
+static void snapshot_aps(ap_ent_t *dst, int *n){
+    int k = 0;
+    for(int i=0;i<nap && k<MAXPEERAP;i++){
+        memcpy(dst[k].bssid, aps[i].bssid, 6);
+        dst[k].rssi = (int8_t)aps[i].rssi;
+        k++;
+    }
+    *n = k;
+}
+static void send_scan_req(void){
+    scanmsg_t m; m.type = MSG_SCAN_REQ; m.n = 0;
+    esp_now_send(BCAST, (uint8_t*)&m, 2);
+}
+static void send_scan_resp(void){
+    scanmsg_t m; m.type = MSG_SCAN_RESP;
+    int n; snapshot_aps(m.e, &n); m.n = (uint8_t)n;
+    esp_now_send(BCAST, (uint8_t*)&m, 2 + n*sizeof(ap_ent_t));
+}
+
+/* Solve for B's bearing in the walking frame.
+   A1=(0,0), A2=(s,0). B lies on the intersection of circles r=dAB1 about A1
+   and r=dAB2 about A2. Returns |angle| off the walk direction; the sign is NOT
+   recoverable from ranges alone (see note). */
+static bool tri_solve(float s, float *out_ang, float *out_q){
+    float d1 = capA_dab[0], d2 = capA_dab[1];
+    if(d1 <= 0 || d2 <= 0 || s <= 0.1f) return false;
+    float x = (d1*d1 - d2*d2 + s*s) / (2.0f*s);
+    float h2 = d1*d1 - x*x;
+    if(h2 < 0){                       // ranges inconsistent - clamp to closest
+        h2 = 0;
+        if(x >  d1) x =  d1;
+        if(x < -d1) x = -d1;
+    }
+    float y = sqrtf(h2);
+    float ang = atan2f(y, x) * 180.0f/(float)M_PI;   // 0 = dead ahead
+
+    // Quality: how well do the common APs agree with this solution? For each
+    // AP we place it from our own two ranges, then check B's reported range.
+    float err = 0; int used = 0;
+    for(int i=0;i<capA_n[0];i++){
+        int j1=-1, j2=-1;
+        for(int k=0;k<capA_n[1];k++)  if(!memcmp(capA[0][i].bssid,capA[1][k].bssid,6)) j1=k;
+        for(int k=0;k<peer_nap;k++)   if(!memcmp(capA[0][i].bssid,peer_aps[k].bssid,6)) j2=k;
+        if(j1<0 || j2<0) continue;
+        float r1 = rssi_range(capA[0][i].rssi);
+        float r2 = rssi_range(capA[1][j1].rssi);
+        float rb = rssi_range(peer_aps[j2].rssi);
+        float px = (r1*r1 - r2*r2 + s*s) / (2.0f*s);
+        float ph2 = r1*r1 - px*px;
+        if(ph2 < 0) continue;
+        float py = sqrtf(ph2);                   // same side as B by convention
+        float bx = d1*cosf(ang*(float)M_PI/180.0f);
+        float by = d1*sinf(ang*(float)M_PI/180.0f);
+        float pred = sqrtf((px-bx)*(px-bx) + (py-by)*(py-by));
+        err += fabsf(pred - rb);
+        used++;
+    }
+    tri_common = used;
+    *out_ang = ang;
+    *out_q = used ? (err/used) : -1;             // mean |residual| in metres
+    return true;
 }
 
 /* ---------------- pages ---------------- */
@@ -784,7 +902,80 @@ static void draw_find(void){
         rect(6+i*3, gy+gh-hgt, 2, hgt, hgt>gh/2?C_OK:C_BAR);
     }
 }
-static void (*PAGEFN[2])(void) = { draw_list, draw_find };
+
+static void tri_capture(void){
+    if(!have_target) return;
+    int idx = (tri_stage == 0) ? 0 : 1;
+    esp_wifi_set_promiscuous(false);
+    do_scan();                                  // fresh AP list at this point
+    snapshot_aps(capA[idx], &capA_n[idx]);
+    capA_dab[idx] = (target_has_ftm && ftm_cm > 0) ? ftm_cm/100.0f
+                                                   : rssi_to_m(rssi_f);
+    peer_scan_fresh = false;
+    send_scan_req();                            // ask B for its view
+    if(idx == 0){
+        tri_stage = 1; tri_walk = 0; tri_steps = 0;
+        tri_msg = "WALK ~5 STEPS";
+    } else {
+        float s_used = (tri_walk > 0.5f) ? tri_walk : 3.0f;
+        if(tri_solve(s_used, &tri_angle, &tri_quality)){
+            tri_stage = 2; tri_msg = "SOLVED";
+        } else {
+            tri_stage = 0; tri_msg = "failed - retry";
+        }
+    }
+    // back to sniffing the peer
+    { wifi_promiscuous_filter_t f = { .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT };
+      esp_wifi_set_promiscuous_filter(&f);
+      esp_wifi_set_promiscuous_rx_cb(promisc_cb);
+      esp_wifi_set_promiscuous(true); }
+}
+
+static void draw_tri(void){
+    hdr("TRIANGULATE");
+    char q[56];
+    if(!have_target){ text(10,110,"lock a peer first",C_DIM,2); return; }
+
+    text(6,34,tri_msg, tri_stage==2 ? C_OK : C_ACC, 2);
+
+    snprintf(q,sizeof q,"stage %d/2   peer APs %d   common %d",
+             tri_stage, peer_nap, tri_common);
+    text(6,64,q,C_DIM,1);
+    snprintf(q,sizeof q,"A1 range %.1f m   A2 range %.1f m",
+             (double)capA_dab[0], (double)capA_dab[1]);
+    text(6,80,q,C_DIM,1);
+    snprintf(q,sizeof q,"walked %.1f m  (%d steps)",(double)tri_walk,tri_steps);
+    text(6,96,q,C_DIM,1);
+
+    if(tri_stage == 2 && tri_angle >= 0){
+        int cx=252, cy=150, rr=46;
+        rect(cx-2,cy-rr-12,4,8,C_DIM);
+        for(int a=0;a<360;a+=45){
+            float t2=a*(float)M_PI/180.0f;
+            rect(cx+(int)((rr+6)*sinf(t2))-1, cy-(int)((rr+6)*cosf(t2))-1,3,3,C_HDR);
+        }
+        // both mirror solutions drawn: ranges alone cannot pick a side
+        for(int sgn=-1; sgn<=1; sgn+=2){
+            float t2 = sgn*tri_angle*(float)M_PI/180.0f;
+            thick_line(cx,cy, cx+(int)(rr*sinf(t2)), cy-(int)(rr*cosf(t2)), 4,
+                       (sgn==live_side)?C_OK:C_BAR);
+        }
+        rect(cx-4,cy-4,8,8,C_FG);
+        snprintf(q,sizeof q,"%d deg", (int)tri_angle);
+        text(6,120,q,C_OK,2);
+        text(6,148,"off your walk direction",C_DIM,1);
+        text(6,164,"LEFT or RIGHT - walk one",C_DIM,1);
+        text(6,178,"way; warmer = correct",C_DIM,1);
+        if(tri_quality >= 0){
+            snprintf(q,sizeof q,"AP residual %.1f m %s",(double)tri_quality,
+                     tri_quality<4.0f?"(good)":"(weak)");
+            text(6,196,q, tri_quality<4.0f?C_OK:C_ACC,1);
+        }
+    }
+    text(6,H-15,"A: capture   B: reset",C_DIM,1);
+}
+
+static void (*PAGEFN[3])(void) = { draw_list, draw_find, draw_tri };
 
 /* LEDs: proximity ring. Brighter and greener the closer you are. */
 static void leds_tick(int t){
@@ -822,7 +1013,13 @@ static void leds_tick(int t){
 // stalls, the UI, radio and buttons carry on regardless.
 static void log_task(void *arg){
     for(;;){
-        if(have_target)
+        if(tri_stage)
+            printf("TRI stage=%d walk=%.1f steps=%d dAB=(%.1f,%.1f) "
+                   "peerAP=%d common=%d ang=%.0f resid=%.1f\n",
+                   tri_stage,(double)tri_walk,tri_steps,
+                   (double)capA_dab[0],(double)capA_dab[1],
+                   peer_nap,tri_common,(double)tri_angle,(double)tri_quality);
+        else if(have_target)
             printf("find %-14s src=%s rssi=%.0f %-10s ~%.1fm ftm=%lucm span=%.0f\n",
                    (char*)target.ssid, now_fresh()?"espnow":"beacon",
                    (double)rssi_f, trend_txt, (double)rssi_to_m(rssi_f),
@@ -866,9 +1063,15 @@ void app_main(void){
             if(edge&(1u<<BTN_UP))   sel = nap ? (sel+nap-1)%nap : 0;
             if(edge&(1u<<BTN_B))    do_scan();
             if((edge&(1u<<BTN_A)) && nap){ lock_target(); page=1; }
+        } else if(page==2){
+            if(edge&(1u<<BTN_A)) tri_capture();
+            if(edge&(1u<<BTN_B)){ tri_stage=0; tri_angle=-1; tri_quality=-1;
+                                  tri_walk=0; tri_steps=0; tri_common=0;
+                                  tri_msg="A: capture point 1"; }
         } else {
             if(edge&(1u<<BTN_B)){ esp_wifi_set_promiscuous(false); page=0; do_scan(); }
             if(edge&(1u<<BTN_A))  ftm_go();
+            if(edge&(1u<<BTN_RIGHT)) page=2;
             if(edge&(1u<<BTN_UP)) spin_start();
             if(edge&(1u<<BTN_DOWN)){ spin=false; spin_arm=false; spin_done=false;
                                      acc_re=acc_im=0; acc_n=0; bearing_avg=-1; }
@@ -878,6 +1081,16 @@ void app_main(void){
         // plain APs that cannot talk back.
         int src = now_fresh() ? now_rssi : rssi_raw;
 
+        if(scan_req_pending){
+            scan_req_pending = false;
+            esp_wifi_set_promiscuous(false);
+            do_scan();
+            send_scan_resp();
+            wifi_promiscuous_filter_t f = { .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT };
+            esp_wifi_set_promiscuous_filter(&f);
+            esp_wifi_set_promiscuous_rx_cb(promisc_cb);
+            esp_wifi_set_promiscuous(true);
+        }
         accel_read();
         {   static float amag_f = 1000; static bool up = false; static int refr = 0;
             float amag = sqrtf((float)(ax*ax + ay*ay + az*az));

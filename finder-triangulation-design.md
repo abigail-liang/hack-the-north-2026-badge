@@ -3,7 +3,12 @@
 Two-stage method for getting a **direction to walk**, not just a distance,
 using the building's WiFi access points as shared reference points.
 
-Origin: team ideation session, whiteboard diagrams IMG_7303–7306.
+Origin: team ideation session, whiteboard diagrams below.
+
+**Status: implemented and on hardware.** See `firmware/main.c`, the
+TRIANGULATE page. What follows describes the design; the
+[Implementation](#implementation) section at the end records what was actually
+built and what changed once it met reality.
 
 ---
 
@@ -84,6 +89,15 @@ So stage 1 alone cannot tell you which way to walk. It reconstructs the
 *relative* geometry of {A, B, APs} correctly, but that shape is free to rotate
 and reflect: without a compass there is nothing tying it to the room.
 
+**A second, harder limit found while implementing this: left/right is not
+recoverable from ranges at all.** Every measurement we have is a distance, and
+distances are invariant under reflection — mirror B *and* every AP across the
+walk axis and every single range is unchanged. No amount of extra APs fixes
+this, because it is a symmetry of the data, not a shortage of it. Something
+outside the range measurements has to break the tie: the body-shadow spin, a
+second walk leg in a known turn direction, or simply walking one way and
+seeing whether it gets warmer.
+
 **Stage 2 is what actually supplies the missing information.** Walking gives a
 displacement whose direction the user can feel. Re-measuring from A₂ both
 kills the reflection ambiguity and pins the reconstructed map to the walk
@@ -149,3 +163,70 @@ and the arrow keeps pointing at B.
 3. Best AP subset: strongest N, or the spread that minimises dilution?
 4. Can the AP map be cached across sessions, turning this into one-scan
    localisation?
+
+---
+
+## Implementation
+
+Built and flashed to both badges. TRIANGULATE is the third page; **RIGHT**
+from the target list or the finder reaches it.
+
+### Protocol
+
+Scan exchange over ESP-NOW broadcast, two message types:
+
+```
+MSG_SCAN_REQ  0xA1   [type][0]
+MSG_SCAN_RESP 0xA2   [type][n][ {bssid[6], rssi} x n ]
+```
+
+16 APs max, 7 bytes each — 114 bytes, comfortably inside ESP-NOW's 250.
+The request arrives in the RX callback but is served from the main loop, since
+a scan blocks for ~2 s and must not run in an ISR.
+
+### Flow
+
+1. Lock a peer on the target list, press RIGHT for TRIANGULATE.
+2. **A** — captures the AP scan plus the FTM range to B, and requests B's scan.
+3. Screen prompts **WALK ~5 STEPS**; the accelerometer accumulates the baseline.
+4. **A** again — second capture, then solve.
+
+### Solver
+
+A₁ at the origin, A₂ at `(s, 0)` where `s` is the walked baseline and the
+**walk direction is +x**. B sits at the intersection of circles `dAB1` about
+A₁ and `dAB2` about A₂:
+
+```
+x = (d1² − d2² + s²) / 2s
+y = √(d1² − x²)
+θ = atan2(y, x)
+```
+
+Inconsistent ranges (`d1² < x²`, which multipath will produce) clamp to the
+nearest feasible point rather than failing.
+
+The APs are used as a **quality metric rather than to solve**: each common AP
+is placed from our own two ranges, and its predicted distance to the solved B
+is compared against the range B actually reported. The mean absolute residual
+is displayed — under ~4 m the geometry is consistent, above it the solution
+should be distrusted.
+
+### What the screen shows
+
+Both mirror solutions are drawn, since ranges cannot choose between them. The
+one matching the last spin's left/right is highlighted. Text is explicit that
+it is *"LEFT or RIGHT — walk one way; warmer = correct"*, rather than
+pretending to a certainty the physics does not support.
+
+### Honest status
+
+The plumbing works: both badges beacon, exchange scans on request, capture at
+two points and solve. What has **not** been established is whether the answer
+is any *better* than the closing-rate compass already running — the AP
+residual gives a consistency check, but accuracy against known ground truth
+has not been measured. That is the next thing to do, and the design should not
+be trusted over the simpler method until it has been.
+
+The expected limiting factor remains RSSI→distance error: the rings are thick
+annuli, so the AP constraints are weak even though there are several of them.
