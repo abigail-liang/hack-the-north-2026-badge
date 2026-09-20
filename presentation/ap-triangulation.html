@@ -1,0 +1,551 @@
+<title>Badge Finder Triangulation</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root{
+  --paper:#fafaf6;
+  --panel:#ffffff;
+  --ink:#1f2023;
+  --muted:#6c6d72;
+  --line:#dddcd4;
+  --blue:#1758c7;   /* badge A */
+  --red:#c9432b;    /* badge B */
+  --green:#1c7d4d;  /* resolved / go */
+  --ghost:#a9aaad;  /* ambiguity */
+  --accent-soft:rgba(23,88,199,.10);
+}
+:root:not([data-theme="light"]){
+  @media (prefers-color-scheme: dark){
+    --paper:#15171b; --panel:#1c1f24; --ink:#e9e9e4; --muted:#9b9ca2;
+    --line:#33363c; --blue:#6fa2ff; --red:#ff8163; --green:#4cc98a;
+    --ghost:#5c5e64; --accent-soft:rgba(111,162,255,.12);
+  }
+}
+:root[data-theme="dark"]{
+  --paper:#15171b; --panel:#1c1f24; --ink:#e9e9e4; --muted:#9b9ca2;
+  --line:#33363c; --blue:#6fa2ff; --red:#ff8163; --green:#4cc98a;
+  --ghost:#5c5e64; --accent-soft:rgba(111,162,255,.12);
+}
+body{
+  background:var(--paper); color:var(--ink);
+  font-family:"IBM Plex Sans",system-ui,sans-serif;
+  padding-inline:16px; margin:0;
+}
+.wrap{max-width:900px; margin-inline:auto; padding-block:28px 48px;}
+header h1{
+  font-size:clamp(24px,4vw,32px); font-weight:600; margin:0 0 6px; text-wrap:balance;
+}
+header .sub{color:var(--muted); margin:0 0 4px; max-width:62ch; line-height:1.5;}
+.eyebrow{
+  font-family:"IBM Plex Mono",monospace; font-size:12px; letter-spacing:.12em;
+  text-transform:uppercase; color:var(--muted); margin:0 0 10px;
+}
+.stage{
+  margin-top:22px; background:var(--panel); border:1px solid var(--line);
+  border-radius:10px; overflow:hidden;
+}
+canvas{display:block; width:100%; height:auto;}
+.caption{
+  border-top:1px solid var(--line); padding:14px 18px 4px; min-height:86px;
+}
+.caption .step-name{
+  font-family:"IBM Plex Mono",monospace; font-size:12px; letter-spacing:.08em;
+  text-transform:uppercase; color:var(--blue); margin:0 0 4px;
+}
+.caption p{margin:0; line-height:1.55; color:var(--ink); font-size:15px;}
+.caption p .m{font-family:"IBM Plex Mono",monospace; font-size:.92em;}
+.controls{
+  display:flex; align-items:center; gap:10px; padding:12px 18px 16px; flex-wrap:wrap;
+}
+button{
+  font:inherit; font-weight:500; color:var(--ink); background:transparent;
+  border:1px solid var(--line); border-radius:7px; padding:7px 14px; cursor:pointer;
+}
+button:hover{background:var(--accent-soft);}
+button:focus-visible{outline:2px solid var(--blue); outline-offset:2px;}
+button.primary{background:var(--blue); color:var(--paper); border-color:var(--blue); min-width:88px;}
+.dots{display:flex; gap:6px; margin-left:auto; align-items:center;}
+.dots button{
+  width:22px; height:22px; padding:0; border-radius:50%; border:none;
+  display:grid; place-items:center; background:transparent;
+}
+.dots button::after{
+  content:""; width:8px; height:8px; border-radius:50%;
+  background:var(--line); transition:background .2s, transform .2s;
+}
+.dots button[aria-current="step"]::after{background:var(--blue); transform:scale(1.35);}
+.counter{font-family:"IBM Plex Mono",monospace; font-size:13px; color:var(--muted);}
+.notes{margin-top:34px;}
+.notes h2{font-size:17px; font-weight:600; margin:0 0 10px;}
+.notes ul{margin:0; padding-left:20px; line-height:1.6; color:var(--ink);}
+.notes li{margin-bottom:8px; max-width:70ch;}
+.notes .m{font-family:"IBM Plex Mono",monospace; font-size:.92em;}
+.notes .src{color:var(--muted); font-size:13.5px; margin-top:14px;}
+@media (prefers-reduced-motion: reduce){ .dots button::after{transition:none;} }
+</style>
+
+<div class="wrap">
+<header>
+  <p class="eyebrow">Hack the North 2026 · badge finder</p>
+  <h1>Finding a friend with borrowed WiFi</h1>
+  <p class="sub">Two ESP32 badges know how far apart they are (802.11mc FTM) but not
+  which way — no compass, no gyro. The building's access points, visible to both
+  badges, become free reference points. Two captures and a short walk turn a
+  distance into a direction.</p>
+</header>
+
+<div class="stage">
+  <canvas id="cv" aria-label="Step-by-step triangulation animation"></canvas>
+  <div class="caption">
+    <p class="step-name" id="stepName"></p>
+    <p id="stepText"></p>
+  </div>
+  <div class="controls">
+    <button id="prev">← Back</button>
+    <button id="play" class="primary">Pause</button>
+    <button id="next">Next →</button>
+    <button id="voice" aria-pressed="false">Voice: off</button>
+    <span class="counter" id="counter"></span>
+    <span class="dots" id="dots" role="tablist" aria-label="Steps"></span>
+  </div>
+</div>
+
+<section class="notes">
+  <h2>Honest numbers</h2>
+  <ul>
+    <li><span class="m">RSSI → distance</span> is off by a factor of two in practice, so the
+    dashed rings are really thick annuli. But with 5–8 APs the system is over-determined,
+    and multipath errors on different APs largely average out.</li>
+    <li>The parallel-chords fact is real geometry — every chord is exactly 90° to
+    <span class="m">AB</span> — but in the only frame the badge can build it is true
+    <em>by construction</em>. Stage 1 alone recovers the axis you chose, not a real-world
+    direction. The walk in stage 2 is what supplies the missing information.</li>
+    <li>Expected accuracy ±15–25°, versus ±29° for the body-shadow spin it augments.</li>
+    <li>The endgame: APs are static. Cache their solved positions once, and every later
+    locate is a single scan matched against a known map — no walking, no spinning.</li>
+  </ul>
+  <p class="src">From <span class="m">finder-triangulation-design.md</span> — team ideation
+  session, whiteboards IMG_7303–7306.</p>
+</section>
+</div>
+
+<script>
+(() => {
+"use strict";
+const cv = document.getElementById("cv");
+const ctx = cv.getContext("2d");
+const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+/* ---------- world geometry (metres) ---------- */
+const A1 = [0, 0], B = [5, 0];
+const APS = [[1.4, 1.9], [3.9, 1.5], [2.1, -1.7]];
+const mirror = p => [p[0], -p[1]];
+const dist = (p, q) => Math.hypot(p[0]-q[0], p[1]-q[1]);
+const walkAng = 62 * Math.PI/180, walkLen = 1.6;
+const A2 = [walkLen*Math.cos(walkAng), walkLen*Math.sin(walkAng)];
+const dA = APS.map(p => dist(A1, p));
+const dB = APS.map(p => dist(B, p));
+const bearing = Math.atan2(B[1]-A2[1], B[0]-A2[0]);         // A2 -> B
+const thetaDeg = Math.round(Math.abs(walkAng - bearing) * 180/Math.PI);
+
+/* view box: full 5 m FTM ring must fit */
+const VX0=-5.6, VX1=7.6, VY0=-5.5, VY1=5.5;
+let W=0, H=0, S=1;
+function resize(){
+  const cssW = cv.clientWidth || cv.parentElement.clientWidth;
+  const cssH = cssW * (VY1-VY0)/(VX1-VX0);
+  const dpr = Math.min(devicePixelRatio||1, 2);
+  cv.style.height = cssH+"px";
+  cv.width = Math.round(cssW*dpr); cv.height = Math.round(cssH*dpr);
+  W=cv.width; H=cv.height; S = W/(VX1-VX0);
+  draw();
+}
+const X = x => (x-VX0)*S;
+const Y = y => H-(y-VY0)*S;
+const px = m => m*S;
+
+/* ---------- style helpers ---------- */
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+let C = {};
+function palette(){
+  C = {ink:css("--ink"), muted:css("--muted"), line:css("--line"),
+       blue:css("--blue"), red:css("--red"), green:css("--green"),
+       ghost:css("--ghost"), panel:css("--panel")};
+}
+function withA(color, a){
+  ctx.save(); ctx.globalAlpha *= a; ctx.strokeStyle=color; ctx.fillStyle=color;
+  return () => ctx.restore();
+}
+const ease = t => t<0?0 : t>1?1 : t*t*(3-2*t);
+const clamp01 = t => Math.max(0, Math.min(1, t));
+/* sub-window of step progress: 0→1 across [a,b] */
+const win = (t,a,b) => ease(clamp01((t-a)/(b-a)));
+
+/* ---------- primitives ---------- */
+function dot(p, r, color, a=1){
+  const done = withA(color, a);
+  ctx.beginPath(); ctx.arc(X(p[0]), Y(p[1]), r, 0, 7); ctx.fill(); done();
+}
+function tri(p, size, color, a=1, fill=true){
+  const done = withA(color, a);
+  const x=X(p[0]), y=Y(p[1]);
+  ctx.beginPath();
+  ctx.moveTo(x, y-size); ctx.lineTo(x+size*.9, y+size*.75);
+  ctx.lineTo(x-size*.9, y+size*.75); ctx.closePath();
+  ctx.lineWidth = 2*devicePR();
+  fill ? ctx.fill() : ctx.stroke();
+  done();
+}
+function square(p, size, color, a=1, fill=true){
+  const done = withA(color, a);
+  ctx.lineWidth = 2*devicePR();
+  const x=X(p[0])-size/2, y=Y(p[1])-size/2;
+  fill ? ctx.fillRect(x,y,size,size) : ctx.strokeRect(x,y,size,size);
+  done();
+}
+function circle(center, rMetres, color, a=1, dash=[6,6], grow=1, lw=1.4){
+  const done = withA(color, a);
+  ctx.setLineDash(dash.map(d=>d*devicePR()));
+  ctx.lineWidth = lw*devicePR();
+  ctx.beginPath();
+  ctx.arc(X(center[0]), Y(center[1]), px(rMetres), -Math.PI/2, -Math.PI/2 + grow*2*Math.PI);
+  ctx.stroke(); ctx.setLineDash([]); done();
+}
+function line(p, q, color, a=1, dash=null, lw=1.4, grow=1){
+  const done = withA(color, a);
+  if (dash) ctx.setLineDash(dash.map(d=>d*devicePR()));
+  ctx.lineWidth = lw*devicePR();
+  const qx = p[0]+(q[0]-p[0])*grow, qy = p[1]+(q[1]-p[1])*grow;
+  ctx.beginPath(); ctx.moveTo(X(p[0]),Y(p[1])); ctx.lineTo(X(qx),Y(qy)); ctx.stroke();
+  ctx.setLineDash([]); done();
+}
+function arrow(p, q, color, a=1, lw=2, grow=1){
+  const qx = p[0]+(q[0]-p[0])*grow, qy = p[1]+(q[1]-p[1])*grow;
+  line(p, [qx,qy], color, a, null, lw);
+  const done = withA(color, a);
+  const ang = Math.atan2(Y(qy)-Y(p[1]), X(qx)-X(p[0]));
+  const hx=X(qx), hy=Y(qy), h=9*devicePR();
+  ctx.beginPath();
+  ctx.moveTo(hx,hy);
+  ctx.lineTo(hx-h*Math.cos(ang-0.42), hy-h*Math.sin(ang-0.42));
+  ctx.lineTo(hx-h*Math.cos(ang+0.42), hy-h*Math.sin(ang+0.42));
+  ctx.closePath(); ctx.fill(); done();
+}
+function label(text, p, color, a=1, dx=0, dy=0, mono=true, size=12){
+  const done = withA(color, a);
+  ctx.font = `${mono?"500":"400"} ${size*devicePR()}px ${mono?'"IBM Plex Mono"':'"IBM Plex Sans"'}, monospace`;
+  ctx.textAlign="center"; ctx.textBaseline="middle";
+  ctx.fillText(text, X(p[0])+dx*devicePR(), Y(p[1])+dy*devicePR());
+  done();
+}
+function cross(p, size, color, a=1){
+  const done = withA(color, a);
+  ctx.lineWidth = 2*devicePR();
+  const x=X(p[0]), y=Y(p[1]);
+  ctx.beginPath();
+  ctx.moveTo(x-size,y-size); ctx.lineTo(x+size,y+size);
+  ctx.moveTo(x+size,y-size); ctx.lineTo(x-size,y+size);
+  ctx.stroke(); done();
+}
+function devicePR(){ return Math.min(devicePixelRatio||1,2); }
+function grid(){
+  const done = withA(C.line, .5);
+  ctx.lineWidth = 1;
+  for(let x=Math.ceil(VX0); x<=VX1; x+=2){
+    ctx.beginPath(); ctx.moveTo(X(x),0); ctx.lineTo(X(x),H); ctx.stroke();
+  }
+  for(let y=Math.ceil(VY0); y<=VY1; y+=2){
+    ctx.beginPath(); ctx.moveTo(0,Y(y)); ctx.lineTo(W,Y(y)); ctx.stroke();
+  }
+  done();
+  /* scale bar: 2 m */
+  const done2 = withA(C.muted, .9);
+  ctx.lineWidth = 2*devicePR();
+  const y = H-16*devicePR();
+  ctx.beginPath(); ctx.moveTo(X(VX1-2.6), y); ctx.lineTo(X(VX1-0.6), y); ctx.stroke();
+  done2();
+  label("2 m", [VX1-1.6, VY0+0.62], C.muted, .9, 0, 0, true, 11);
+}
+
+/* shared: draw badge A + label */
+function badgeA(p, a=1, name="A"){
+  dot(p, 5.5*devicePR(), C.blue, a);
+  label(name, p, C.blue, a, 0, -16);
+}
+function badgeB(p, a=1, name="B"){
+  tri(p, 7*devicePR(), C.red, a);
+  label(name, p, C.red, a, 0, -18);
+}
+function apTrue(i, a=1){ square(APS[i], 9*devicePR(), C.ink, a); }
+
+/* ---------- steps ---------- */
+const steps = [
+{
+  name: "Step 1 · The room",
+  text: "You hold badge A. Your teammate holds badge B, 5 m away. Around you: the building's WiFi access points — they never move, and both badges can see them. Free reference points.",
+  dur: 5200,
+  draw(t){
+    badgeA(A1, 1, "A (you)");
+    badgeB(B, win(t,.15,.35), "B");
+    APS.forEach((p,i)=>{
+      const a = win(t,.45+i*.12,.7+i*.12);
+      apTrue(i, a*.9);
+    });
+    label("AP₁", APS[0], C.muted, win(t,.55,.8), 0, -16);
+    label("AP₂", APS[1], C.muted, win(t,.67,.9), 0, -16);
+    label("AP₃", APS[2], C.muted, win(t,.78,1), 0, -16);
+  }
+},
+{
+  name: "Step 2 · The problem",
+  text: "FTM time-of-flight says B is 5.0 m away — accurate, but it is only a radius. With no magnetometer and no gyro, B could be anywhere on this ring. A distance is not a direction.",
+  dur: 5200,
+  draw(t){
+    badgeA(A1, 1, "A (you)");
+    APS.forEach((p,i)=> apTrue(i, .35));
+    circle(A1, 5, C.red, .8, [7,7], win(t,0,.45), 1.8);
+    label("|AB| = 5.0 m  (FTM)", [0, -1.2], C.muted, win(t,.15,.4));
+    badgeB(B, .9, "B");
+    /* ghost Bs elsewhere on the ring */
+    const angles = [0.9, 2.2, 3.3, -1.2, -2.4];
+    angles.forEach((ang,i)=>{
+      const a = win(t, .45+i*.08, .65+i*.08) * .45;
+      tri([5*Math.cos(ang), 5*Math.sin(ang)], 7*devicePR(), C.red, a, false);
+    });
+    label("B?", [5*Math.cos(0.9), 5*Math.sin(0.9)], C.red, win(t,.6,.8)*.7, 0, -18);
+  }
+},
+{
+  name: "Step 3 · A measures the APs",
+  text: "Badge A measures RSSI to each access point — path loss turns signal strength into a rough distance, putting each AP somewhere on a dashed circle around A.",
+  dur: 5200,
+  draw(t){
+    badgeA(A1, 1, "A");
+    badgeB(B, .5, "B");
+    APS.forEach((p,i)=> apTrue(i, .85));
+    dA.forEach((r,i)=>{
+      circle(A1, r, C.blue, .75, [5,6], win(t, .1+i*.2, .55+i*.2));
+    });
+    label("dA from RSSI path loss", [0, -4.7], C.blue, win(t,.4,.65), 0, 0, true, 11.5);
+  }
+},
+{
+  name: "Step 4 · B scans too, and a frame is chosen",
+  text: "B runs the same scan and sends its AP list back over ESP-NOW (56 bytes for 8 APs). Now build a coordinate frame: put A at the origin and B at (5, 0) — on the x-axis by construction, since the FTM distance is known but the bearing is not.",
+  dur: 5600,
+  draw(t){
+    badgeA(A1, 1, "A (0,0)");
+    APS.forEach((p,i)=> apTrue(i, .5));
+    /* packet travels B->A */
+    const tp = win(t, .05, .3);
+    line([4.7, 0.6], [0.3, 0.15], C.muted, tp<1?.6:0, [2,5], 1.2, tp);
+    label("ESP-NOW: B's AP list", [2.6, 1.1], C.muted, tp<1? tp*.9 : Math.max(0,1-win(t,.3,.45)), 0, 0, true, 11);
+    const tb = win(t, .3, .5);
+    line(A1, B, C.ink, tb*.6, [1,4], 1.2, tb);
+    badgeB(B, 1, "B (5,0)");
+    label("by construction", [5, -0.8], C.muted, win(t,.45,.6), 0, 0, false, 11.5);
+    dA.forEach((r)=> circle(A1, r, C.blue, .4, [5,6]));
+    dB.forEach((r,i)=> circle(B, r, C.red, .7, [5,6], win(t, .5+i*.15, .8+i*.15)));
+    label("dB from B's scan", [5, -4.5], C.red, win(t,.65,.9), 0, 0, true, 11.5);
+  }
+},
+{
+  name: "Step 5 · Circles intersect — twice",
+  text: "For each shared AP: a circle of radius dA about A and radius dB about B. They cross at two points, mirror images across the AB line — so every chord between a candidate pair is exactly perpendicular to AB, and all chords are parallel. Real geometry, but in this frame it is true by construction.",
+  dur: 6200,
+  draw(t){
+    badgeA(A1); badgeB(B);
+    line(A1, B, C.ink, .5, [1,4], 1.2);
+    dA.forEach((r)=> circle(A1, r, C.blue, .3, [5,6]));
+    dB.forEach((r)=> circle(B, r, C.red, .3, [5,6]));
+    APS.forEach((p,i)=>{
+      const a = win(t, .05+i*.18, .3+i*.18);
+      square(p, 9*devicePR(), C.ink, a, false);
+      square(mirror(p), 9*devicePR(), C.ink, a, false);
+      const tc = win(t, .25+i*.18, .55+i*.18);
+      line(p, mirror(p), C.green, tc*.9, [3,4], 1.6, tc);
+    });
+    label("two candidates per AP", [2.0, 3.0], C.ink, win(t,.35,.6), 0, 0, false, 12.5);
+    label("all chords ⊥ AB", [3.6, -3.0], C.green, win(t,.75,.95), 0, 0, true, 12);
+  }
+},
+{
+  name: "Step 6 · The catch — the shape can still flip",
+  text: "Stage 1 recovers the relative shape of {A, B, APs} correctly, but nothing ties it to the room: the whole map can rotate, and each AP could sit on either side of AB. The perpendicular chords only recover the axis we ourselves chose. Stage 1 alone cannot say which way to walk.",
+  dur: 6000,
+  draw(t){
+    line(A1, B, C.ink, .4, [1,4], 1.2);
+    badgeA(A1); badgeB(B, .9);
+    /* mirror worlds pulse alternately */
+    const phase = reduced ? 0.5 : (Math.sin(t*Math.PI*4)+1)/2;
+    APS.forEach((p)=>{
+      square(p, 9*devicePR(), C.ink, .25+.6*phase, false);
+      square(mirror(p), 9*devicePR(), C.ink, .25+.6*(1-phase), false);
+      line(p, mirror(p), C.ghost, .5, [3,4], 1.2);
+    });
+    /* rotating ghost copy of the whole constellation */
+    const rot = reduced ? .5 : Math.sin(t*Math.PI*2)*.5;
+    const ang = rot*0.55;
+    const R = ([x,y]) => [x*Math.cos(ang)-y*Math.sin(ang), x*Math.sin(ang)+y*Math.cos(ang)];
+    const ga = win(t,.15,.35)*.4;
+    line(A1, R(B), C.ghost, ga, [2,4], 1.2);
+    tri(R(B), 7*devicePR(), C.ghost, ga, false);
+    APS.forEach(p => square(R(p), 9*devicePR(), C.ghost, ga*.8, false));
+    label("…or rotated?", [R(B)[0], R(B)[1]], C.ghost, ga*1.6, 0, -20, false, 12);
+    label("mirror world fits the data equally well", [1, -4.6], C.muted, win(t,.4,.65), 0, 0, false, 12.5);
+  }
+},
+{
+  name: "Step 7 · Stage 2 — walk, then measure again",
+  text: "The user walks a few steps in any direction. The accelerometer counts steps (≈0.72 m each) and the direction is simply “straight ahead” in their own body frame — a direction they can feel. From the new position A₂, badge A re-scans: only one candidate in each mirror pair fits the new distances.",
+  dur: 6200,
+  draw(t){
+    line(A1, B, C.ink, .35, [1,4], 1.2);
+    badgeB(B);
+    /* walk */
+    const tw = win(t, .05, .3);
+    arrow(A1, A2, C.blue, tw, 2.4, tw);
+    const Anow = [A1[0]+(A2[0]-A1[0])*tw, A1[1]+(A2[1]-A1[1])*tw];
+    badgeA(Anow, 1, tw>=1 ? "A₂" : "A");
+    label("1.6 m, straight ahead", [-0.4, 1.3], C.blue, win(t,.15,.35), -52, 0, true, 11.5);
+    /* re-scan rings from A2 */
+    APS.forEach((p,i)=>{
+      const r2 = dist(A2, p);
+      circle(A2, r2, C.blue, .6*win(t,.35+i*.12,.6+i*.12), [5,6], win(t,.35+i*.12,.6+i*.12));
+    });
+    /* candidates resolve */
+    APS.forEach((p,i)=>{
+      const ts = win(t, .6+i*.1, .8+i*.1);
+      square(p, 9*devicePR(), C.ink, .3+.7*ts, ts>.5);
+      const m = mirror(p);
+      square(m, 9*devicePR(), C.ghost, (1-ts)*.8, false);
+      cross(m, 7*devicePR(), C.red, ts*(1-win(t,.9,1))*.9);
+    });
+    label("A₂'s rings pick the true side", [1, -4.6], C.muted, win(t,.7,.9), 0, 0, false, 12.5);
+  }
+},
+{
+  name: "Step 8 · A direction to walk",
+  text: "Three anchors — A₁, B, A₂ — pin the map to the direction the user just walked. The bearing to B becomes an angle relative to their own heading: “about 80° to your right.” And since APs never move, the solved map can be cached — the next locate is a single scan, no walking, no spinning.",
+  dur: 7000,
+  draw(t){
+    line(A1, B, C.ink, .25, [1,4], 1.2);
+    APS.forEach((p,i)=> apTrue(i, .9));
+    dot(A1, 4*devicePR(), C.ghost, .8); label("A₁", A1, C.ghost, .9, 0, -14);
+    line(A1, A2, C.ghost, .7, [2,4], 1.4);
+    badgeA(A2, 1, "A₂");
+    badgeB(B);
+    /* heading (walk dir, extended) */
+    const hEnd = [A2[0]+1.7*Math.cos(walkAng), A2[1]+1.7*Math.sin(walkAng)];
+    arrow(A2, hEnd, C.ghost, win(t,.05,.25), 2, win(t,.05,.25));
+    label("your heading", hEnd, C.muted, win(t,.15,.3), 6, -14, false, 11.5);
+    /* bearing arrow to B */
+    arrow(A2, B, C.green, win(t,.25,.5), 3, win(t,.25,.5));
+    /* angle arc between heading and bearing */
+    const ta = win(t,.5,.7);
+    if (ta>0){
+      const done = withA(C.green, ta);
+      ctx.lineWidth = 1.6*devicePR();
+      ctx.beginPath();
+      ctx.arc(X(A2[0]), Y(A2[1]), px(1.35), -walkAng, -bearing, false);
+      ctx.stroke(); done();
+      const mid = (walkAng+bearing)/2;
+      label("θ ≈ "+thetaDeg+"°", [A2[0]+1.95*Math.cos(mid), A2[1]+1.95*Math.sin(mid)], C.green, ta);
+    }
+    label("cache the AP map → next time, one scan", [1, -4.6], C.muted, win(t,.75,.95), 0, 0, false, 12.5);
+  }
+}
+];
+
+/* ---------- engine ---------- */
+let step = 0, t0 = performance.now(), playing = true, holdT = null;
+const stepName = document.getElementById("stepName");
+const stepText = document.getElementById("stepText");
+const counter = document.getElementById("counter");
+const dotsEl = document.getElementById("dots");
+steps.forEach((s,i)=>{
+  const b = document.createElement("button");
+  b.title = s.name; b.setAttribute("aria-label", s.name);
+  b.addEventListener("click", ()=> go(i, false));
+  dotsEl.appendChild(b);
+});
+function syncUI(){
+  stepName.textContent = steps[step].name;
+  stepText.textContent = steps[step].text;
+  counter.textContent = (step+1) + " / " + steps.length;
+  [...dotsEl.children].forEach((b,i)=>
+    i===step ? b.setAttribute("aria-current","step") : b.removeAttribute("aria-current"));
+}
+function go(i, fromAuto){
+  step = ((i % steps.length) + steps.length) % steps.length;
+  t0 = performance.now(); holdT = null;
+  if (!fromAuto && !playing) drawStatic();
+  syncUI();
+  speak();
+}
+function drawStatic(){ render(1); }
+function render(t){
+  palette();
+  ctx.clearRect(0,0,W,H);
+  ctx.fillStyle = C.panel; ctx.fillRect(0,0,W,H);
+  grid();
+  steps[step].draw(t);
+}
+function draw(){ render(currentT()); }
+function currentT(){
+  if (reduced) return 1;
+  return clamp01((performance.now()-t0)/steps[step].dur);
+}
+function tick(){
+  requestAnimationFrame(tick);
+  if (reduced){
+    render(1);
+    if (playing && (!voiceOn || voiceDone)){
+      if (holdT===null) holdT = performance.now();
+      if (performance.now()-holdT > steps[step].dur){ go(step+1, true); }
+    }
+    return;
+  }
+  const t = currentT();
+  render(t);
+  if (playing && t>=1 && (!voiceOn || voiceDone)){
+    if (holdT===null) holdT = performance.now();
+    if (performance.now()-holdT > 1400) go(step+1, true);
+  }
+}
+document.getElementById("prev").addEventListener("click", ()=> go(step-1, false));
+document.getElementById("next").addEventListener("click", ()=> go(step+1, false));
+/* ---- voiceover: neural TTS clips published alongside the page ---- */
+let voiceOn = false, voiceDone = true, audioEl = null;
+const voiceBtn = document.getElementById("voice");
+function speak(){
+  if (audioEl){ try{ audioEl.pause(); }catch(e){} audioEl = null; }
+  if (!voiceOn){ voiceDone = true; return; }
+  voiceDone = false;
+  audioEl = new Audio("narr/" + (step + 1) + ".mp3");
+  audioEl.onended = ()=>{ voiceDone = true; holdT = null; };
+  audioEl.onerror = ()=>{ voiceDone = true; };
+  audioEl.play().catch(()=>{ voiceDone = true; });
+}
+voiceBtn.addEventListener("click", ()=>{
+  voiceOn = !voiceOn;
+  voiceBtn.textContent = "Voice: " + (voiceOn ? "on" : "off");
+  voiceBtn.setAttribute("aria-pressed", String(voiceOn));
+  speak();
+});
+addEventListener("pagehide", ()=>{ if (audioEl) try{ audioEl.pause(); }catch(e){} });
+
+const playBtn = document.getElementById("play");
+playBtn.addEventListener("click", ()=>{
+  playing = !playing;
+  playBtn.textContent = playing ? "Pause" : "Play";
+  if (playing && currentT()>=1) go(step+1, false);
+});
+addEventListener("keydown", e=>{
+  if (e.key==="ArrowRight") go(step+1, false);
+  if (e.key==="ArrowLeft") go(step-1, false);
+});
+addEventListener("resize", resize);
+matchMedia("(prefers-color-scheme: dark)").addEventListener?.("change", draw);
+syncUI(); resize(); requestAnimationFrame(tick);
+})();
+</script>
