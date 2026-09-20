@@ -173,3 +173,40 @@ That single line localises the break — sent-but-not-arrived, arrived-but-not-
 answered, or send failing outright — without any guessing. Add it before the
 first fix attempt, not after the third.
 
+
+## The walk counter was never wired to the step detector
+
+Stage 1 asks the user to walk a baseline, and the solver needs its length. The
+accelerometer step detector existed and worked, but `step_detected()` only
+incremented a global `steps` left over from an earlier compass feature —
+`tri_steps` and `tri_walk` were reset on entry to stage 1 and never
+incremented.
+
+The failure was silent, which is what made it expensive. The screen sat at
+"0 steps / 0.0 m" no matter how far you walked, and the capture path quietly
+fell back to an assumed 3 m baseline, so the solved bearing was computed
+against a made-up distance rather than failing outright.
+
+Fixed by incrementing `tri_steps` / `tri_walk` from `step_detected()` whenever
+`tri_stage == 1`. Step length is 0.72 m; the detector uses a smoothed |a| with
+1150/1050 mg hysteresis and an 8-tick (160 ms) refractory period.
+
+## A blocking scan should freeze the frame, not wipe it
+
+`do_scan()` blocks for about 2 s and used to paint "scanning..." over the whole
+screen first, on the theory that a wipe looks less broken than a freeze. On a
+page showing a map it is the other way round — a still frame reads as "busy",
+a wipe reads as "crashed".
+
+A `scan_silent` flag now leaves the last frame up. It is set around the capture
+scan and around the scan a badge runs when *answering* a peer's request. The
+second case matters more: that scan is triggered by the **other** badge, so
+whoever is holding this one sees their screen blank for two seconds with no
+input of their own.
+
+## The slow part was not the scan
+
+A capture felt slow, and the obvious suspect was the 13-channel scan (~2 s).
+The actual cost was `FTM_BURST = 20` — twenty ranging sessions at up to 500 ms
+each. Measuring before optimising would have found this immediately; reasoning
+about it pointed at the wrong thing.

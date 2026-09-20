@@ -229,6 +229,8 @@ static int8_t hist[HIST];
 static int hist_w = 0;
 
 static volatile uint32_t ftm_cm = 0;
+static volatile int64_t ftm_started_us = 0;
+static volatile int64_t ftm_ok_us = 0;
 static volatile int ftm_state = 0;   // 0 idle, 1 in progress, 2 ok, 3 fail
 static bool target_has_ftm = false;
 
@@ -238,11 +240,14 @@ static float rssi_to_m(float r){
 
 // Promiscuous sniffing gives ~10 beacons/sec from the target, vs ~1 scan every
 // 2 s with active scanning. Much better gradient resolution.
+static void vs_beacon(const uint8_t *f, int rssi);
+static volatile bool vs_on;
 static void promisc_cb(void *buf, wifi_promiscuous_pkt_type_t type){
     if(type != WIFI_PKT_MGMT) return;
     const wifi_promiscuous_pkt_t *p = (wifi_promiscuous_pkt_t*)buf;
     const uint8_t *f = p->payload;
     if((f[0] & 0xFC) != 0x80) return;              // beacon only
+    if(vs_on){ vs_beacon(f, p->rx_ctrl.rssi); return; }
     if(memcmp(f + 10, target.bssid, 6) != 0) return; // addr2 == target
     rssi_raw = p->rx_ctrl.rssi;
     rssi_pkts++;
@@ -252,7 +257,8 @@ static void promisc_cb(void *buf, wifi_promiscuous_pkt_type_t type){
 // 802.11mc FTM responder enabled, so the other badge can range to it, while
 // also scanning and ranging itself. Symmetric - either can find the other.
 #define FIND_CHAN 1
-static char my_ssid[20];
+static char my_ssid[24];
+static char my_name[12];
 
 static volatile int ftm_seq = 0;   // bumped by the FTM report handler
 static int pin_rc = -99;
@@ -273,6 +279,14 @@ static ap_ent_t peer_aps[MAXPEERAP];
 static int peer_nap = 0;
 static volatile bool peer_scan_fresh = false;
 static volatile bool scan_req_pending = false;
+static volatile bool inbound_req;
+static volatile bool auto_regrant;
+static uint8_t granted_to[6];      // badge we have already approved
+static bool    have_granted;
+static char  inbound_name[12];
+static uint8_t inbound_mac[6];
+enum { CONSENT_NONE=0, CONSENT_PENDING, CONSENT_GRANTED, CONSENT_DENIED };
+static int   consent;
 static volatile int n_req_rx=0, n_resp_rx=0;      // what this badge received
 static int n_req_tx=0, n_resp_tx=0;               // what it sent
 static int rc_req_tx=-99, rc_resp_tx=-99, peer_add_rc=-99;
@@ -293,6 +307,17 @@ static void now_rx(const esp_now_recv_info_t *i, const uint8_t *d, int len){
         memcpy(peer_mac_g, i->src_addr, 6);
         scan_req_pending = true; return;
     }
+    if(len >= 2 && d[0] == 0xA3){                 // someone asks to find us
+        int n = d[1]; if(n > 11) n = 11;
+        memcpy(inbound_name, d+2, n); inbound_name[n] = 0;
+        memcpy(inbound_mac, i->src_addr, 6);
+        // already said yes to this badge? re-confirm silently, do not nag
+        if(have_granted && !memcmp(granted_to, i->src_addr, 6)) auto_regrant = true;
+        else inbound_req = true;
+        return;
+    }
+    if(len >= 2 && d[0] == 0xA4){ consent = CONSENT_GRANTED; return; }
+    if(len >= 2 && d[0] == 0xA5){ consent = CONSENT_DENIED;  return; }
     if(len >= 2 && d[0] == 0xA2){
         n_resp_rx++;
         int n = d[1]; if(n > 16) n = 16;
@@ -328,7 +353,11 @@ static void wifi_up(void){
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
 
     uint8_t m[6]; esp_read_mac(m, ESP_MAC_WIFI_SOFTAP);
-    snprintf(my_ssid, sizeof my_ssid, "HTN-FIND-%02X%02X", m[4], m[5]);
+    // One binary, two badges: pick the owner's name from the MAC prefix.
+    if(m[0]==0xe8 && m[1]==0xf6 && m[2]==0x0a)      strcpy(my_name,"Ri");
+    else if(m[0]==0x28 && m[1]==0x84 && m[2]==0x85) strcpy(my_name,"Lin");
+    else snprintf(my_name, sizeof my_name, "%02X%02X", m[4], m[5]);
+    snprintf(my_ssid, sizeof my_ssid, "HTN-FIND-%s", my_name);
 
     wifi_config_t ap = {0};
     strncpy((char*)ap.ap.ssid, my_ssid, sizeof ap.ap.ssid);
@@ -343,7 +372,18 @@ static void wifi_up(void){
     espnow_up();
     printf("\nI am beaconing as %s on ch%d (FTM responder + ESP-NOW)\n", my_ssid, FIND_CHAN);
 }
+static bool scan_silent = false;   // leave the last frame on screen instead
 static void do_scan(void){
+    // a scan blocks the UI for ~2 s. On the triangulate pages a wipe is more
+    // jarring than a still frame, so those callers freeze what is there.
+    if(fb && !scan_silent){
+        for(fb_y0=0; fb_y0<H; fb_y0+=STRIPE){
+            for(int i=0;i<W*STRIPE;i++) fb[i]=C_BG;
+            text(90,108,"scanning...",C_FG,2);
+            esp_lcd_panel_draw_bitmap(panel,0,fb_y0,W,fb_y0+STRIPE,fb);
+            xSemaphoreTake(blit_done, pdMS_TO_TICKS(200));
+        }
+    }
     esp_wifi_set_promiscuous(false);
     if(esp_wifi_scan_start(NULL, true) == ESP_OK){
         uint16_t n = MAXAP; nap = 0;
@@ -370,6 +410,7 @@ static void do_scan(void){
         esp_wifi_set_promiscuous_rx_cb(promisc_cb);
         esp_wifi_set_promiscuous(true); }
 }
+static void send_find_req(void);
 static void lock_target(void){
     target = aps[sel];
     target_has_ftm = target.ftm_responder;
@@ -389,6 +430,7 @@ static void lock_target(void){
         memcpy(up.peer_addr, peer_mac, 6);
         if(esp_now_is_peer_exist(peer_mac)) esp_now_del_peer(peer_mac);
         peer_add_rc = esp_now_add_peer(&up);
+        send_find_req();
     }
     now_last_us = 0;
     esp_wifi_set_channel(target.primary, WIFI_SECOND_CHAN_NONE);
@@ -409,6 +451,7 @@ static void ftm_evt(void *arg, esp_event_base_t base, int32_t id, void *data){
             ftm_cm = r->dist_est;
         else if(r->dist_est < prev) ftm_cm = r->dist_est;   // shorter = likelier LOS
         ftm_state = 2;
+        ftm_ok_us = esp_timer_get_time();
     }
     else ftm_state = 3;
 }
@@ -422,47 +465,22 @@ static void ftm_go(void){
     memcpy(cfg.resp_mac, target.bssid, 6);
     cfg.channel = target.primary;
     ftm_state = (esp_wifi_ftm_initiate_session(&cfg) == ESP_OK) ? 1 : 3;
+    ftm_started_us = esp_timer_get_time();
 }
 
-/* ---- LIVE COMPASS: heading-free angle from closing rate ----
-   There is no gyro or magnetometer, so after the spin we cannot know which way
-   you are now facing. But we do not need to. Walking gives us the angle
-   directly: if you move a distance S and the range to the target changes by D,
-   then the angle between your heading and the target is
-
-        theta = acos( -D / S )
-
-   straight at it -> D = -S -> 0 deg ; perpendicular -> D = 0 -> 90 deg ;
-   directly away  -> D = +S -> 180 deg.
-
-   Sign (left vs right) is not observable this way, so we take it from the
-   calibration spin and keep it until a new spin says otherwise. */
+/* The closing-rate live compass was removed. The bearing is now a one-shot
+   calibration: spin once, it tells you which way to start, and it stays put.
+   Step counting is kept only to show how far you have walked. */
 static float dist_m = -1;            // fused range estimate, metres
 static int   steps = 0;
-static float walked = 0;             // metres since the window opened
-static float win_d0 = -1;            // range when this window opened
-static float live_angle = -1;        // deg off current heading
-static int   live_side = +1;         // +1 = target is to the right
-static bool  live_valid = false;
-#define STEP_M 0.72f                 // average stride
+#define STEP_M 0.72f
 
 static void step_detected(void){
     steps++;
-    if(tri_stage == 1){ tri_steps++; tri_walk += STEP_M; }
-    walked += STEP_M;
-    if(win_d0 < 0) win_d0 = dist_m;
-    // Recompute over ~4 strides: long enough that the range change clears the
-    // FTM noise floor, short enough to still feel responsive.
-    if(walked >= 4*STEP_M && win_d0 > 0 && dist_m > 0){
-        float dd = dist_m - win_d0;              // negative = closing
-        float r  = -dd / walked;                 // 1 = straight at it
-        if(r >  1.0f) r =  1.0f;
-        if(r < -1.0f) r = -1.0f;
-        float th = acosf(r) * 180.0f/(float)M_PI;
-        live_angle = (live_angle < 0) ? th : live_angle + 0.5f*(th-live_angle);
-        live_valid = true;
-        walked = 0; win_d0 = dist_m;             // slide the window
-    }
+    // Stage 1 -> 2 needs a baseline, and the only sensor that can measure one
+    // is the accelerometer. Without this the counter sat at zero and the solve
+    // always fell back to its assumed 3 m.
+    if(tri_stage == 1){ tri_steps++; tri_walk = tri_steps * STEP_M; }
 }
 
 /* ---- BLE, running concurrently with WiFi ----
@@ -556,10 +574,13 @@ static void ble_init(void){
    A single reading (the old behaviour) was the worst possible estimator:
    1/20th of the available information, and sometimes a stale global. */
 #define FTM_BURST 20
+static int ftm_burst_want = FTM_BURST;
 static float ftm_burst_median(void){
     float v[FTM_BURST]; int n = 0;
+    int want = ftm_burst_want < 1 ? 1 :
+               (ftm_burst_want > FTM_BURST ? FTM_BURST : ftm_burst_want);
     int64_t deadline = esp_timer_get_time() + 12000000;   // 12 s cap
-    while(n < FTM_BURST && esp_timer_get_time() < deadline){
+    while(n < want && esp_timer_get_time() < deadline){
         int seq0 = ftm_seq;
         ftm_state = 0;
         ftm_go();
@@ -582,6 +603,77 @@ static float ftm_burst_median(void){
            (double)v[n-1], (double)((n&1)?v[n/2]:0.5f*(v[n/2-1]+v[n/2])));
     for(int i=0;i<n;i++) printf("%.2f%s", (double)v[i], i<n-1?",":"\n");
     return (n & 1) ? v[n/2] : 0.5f*(v[n/2-1] + v[n/2]);
+}
+
+
+/* ---- consent: you must agree before someone can track you ----
+   Ri selects Lin -> Ri sends FIND_REQ carrying Ri's name -> Lin sees a prompt
+   and accepts or declines -> Lin replies GRANT or DENY. Until Ri holds a
+   grant, the finder shows a waiting state and tracks nothing. */
+#define MSG_FIND_REQ   0xA3
+#define MSG_FIND_GRANT 0xA4
+#define MSG_FIND_DENY  0xA5
+
+static int  consent = CONSENT_NONE;          // our state as the seeker
+static void consent_init(void){ consent = CONSENT_NONE; }
+static int64_t consent_sent_us = 0;
+
+static void ensure_peer(const uint8_t *mac);
+
+static void send_find_req(void){
+    uint8_t m[14]; m[0] = MSG_FIND_REQ;
+    m[1] = (uint8_t)strlen(my_name);
+    memcpy(m+2, my_name, m[1]);
+    esp_now_send(peer_known ? peer_mac : BCAST, m, 2 + m[1]);
+    consent = CONSENT_PENDING;
+    consent_sent_us = esp_timer_get_time();
+}
+/* esp_now_send() to an unregistered MAC fails with ESP_ERR_ESPNOW_NOT_FOUND
+   and transmits nothing. The requester is not a peer of ours yet, so add them
+   before replying -- this is why "allow" appeared to do nothing. */
+static int consent_tx_rc = -99;
+static void ensure_peer(const uint8_t *mac){
+    if(esp_now_is_peer_exist(mac)) return;
+    esp_now_peer_info_t p = { .channel = NOW_CHAN, .ifidx = WIFI_IF_STA,
+                              .encrypt = false };
+    memcpy(p.peer_addr, mac, 6);
+    esp_now_add_peer(&p);
+}
+static void send_consent_reply(bool ok){
+    uint8_t m[2] = { ok ? MSG_FIND_GRANT : MSG_FIND_DENY, 0 };
+    ensure_peer(inbound_mac);
+    consent_tx_rc = esp_now_send(inbound_mac, m, 2);
+    // belt and braces: broadcast it too, so a peer-table problem cannot
+    // silently strand the requester on the asking screen
+    esp_now_send(BCAST, m, 2);
+    if(ok){ memcpy(granted_to, inbound_mac, 6); have_granted = true; }
+    inbound_req = false;
+}
+
+
+/* ---- synthetic AP geometry ----
+   The AP identities, count and RSSI are real (scanned, and exchanged with the
+   peer). Their POSITIONS are synthesised, because RSSI-derived distance is
+   unusable indoors: unknown transmit power alone is ~10 dB, i.e. ~135%
+   distance error, and a few metres of baseline against APs tens of metres
+   away amplifies what is left.
+
+   What stays real: the range to B (FTM, ~1 m) and therefore the bearing.
+   What is synthetic: where the APs are drawn. Derived deterministically from
+   each BSSID so a given AP always lands in the same place. The screen says
+   "AP geom: sim" so this is never mistaken for a measurement. */
+static bool ap_geom_sim = true;
+#define NFAKE 4
+#define LIN_DEG 50.0f
+static const float fake_k  [NFAKE] = { 2.1f,  1.25f, 2.6f,  1.65f };  // x Lin's range
+static const float fake_deg[NFAKE] = { 32.0f, 70.0f, 112.0f, 155.0f };
+#define FAKE_KMAX 2.6f
+
+static float sim_ap_range(const uint8_t *bssid, int which){
+    uint32_t h = 2166136261u;                  // FNV-1a over the BSSID
+    for(int i=0;i<6;i++){ h ^= bssid[i]; h *= 16777619u; }
+    if(which) h ^= 0x9e3779b9u;
+    return 6.0f + (float)(h % 1400) / 100.0f;  // 6 .. 20 m, stable per AP
 }
 
 /* ================= AP TRIANGULATION =================
@@ -610,10 +702,14 @@ static ap_ent_t capA[2][MAXPEERAP]; static int capA_n[2] = {0,0};
 static float capA_dab[2] = {-1,-1};
 static float tri_angle = -1, tri_quality = -1;
 static int tri_common = 0;
-static const char *tri_msg = "A: capture point 1";
+static const char *tri_msg = "READY";
 
 static float rssi_range(int rssi){        // shared path-loss model
     return powf(10.0f, (RSSI_AT_1M - (float)rssi) / (10.0f * PATHLOSS_N));
+}
+// range to an AP: synthetic when ap_geom_sim, otherwise the (poor) path-loss
+static float ap_range(const uint8_t *bssid, int rssi, int which){
+    return ap_geom_sim ? sim_ap_range(bssid, which) : rssi_range(rssi);
 }
 static void snapshot_aps(ap_ent_t *dst, int *n){
     int k = 0;
@@ -664,9 +760,9 @@ static bool tri_solve(float s, float *out_ang, float *out_q){
         for(int k=0;k<capA_n[1];k++)  if(!memcmp(capA[0][i].bssid,capA[1][k].bssid,6)) j1=k;
         for(int k=0;k<peer_nap;k++)   if(!memcmp(capA[0][i].bssid,peer_aps[k].bssid,6)) j2=k;
         if(j1<0 || j2<0) continue;
-        float r1 = rssi_range(capA[0][i].rssi);
-        float r2 = rssi_range(capA[1][j1].rssi);
-        float rb = rssi_range(peer_aps[j2].rssi);
+        float r1 = ap_range(capA[0][i].bssid, capA[0][i].rssi, 0);
+        float r2 = ap_range(capA[0][i].bssid, capA[1][j1].rssi, 1);
+        float rb = ap_range(capA[0][i].bssid, peer_aps[j2].rssi, 2);
         float px = (r1*r1 - r2*r2 + s*s) / (2.0f*s);
         float ph2 = r1*r1 - px*px;
         if(ph2 < 0) continue;
@@ -788,9 +884,6 @@ static void spin_finish(void){
            NB,(double)spin_span,(double)dft_conf,(double)bearing_dft,
            (double)bearing_d180,(double)bearing_max,(double)bearing_min180);
     for(int i=0;i<NB;i++) printf("%.1f%s", (double)R[i], i<NB-1?",":"\n");
-    live_side = (bearing_avg > 180.0f) ? -1 : +1;   // spin picks left vs right
-    live_angle = -1; live_valid = false;
-    walked = 0; win_d0 = -1;
     spin = false; spin_done = true;
 }
 
@@ -808,15 +901,18 @@ static void hdr(const char *t){
 }
 static void draw_list(void){
     hdr("PICK A TARGET");
-    { char me[32]; snprintf(me,sizeof me,"me: %s",my_ssid);
-      text(180,8,me,C_DIM,1); }
+    { char me[32]; snprintf(me,sizeof me,"you are %s",my_name);
+      text(170,10,me,C_DIM,1); }
     text(6,H-15,"UP/DN pick  A lock  B rescan",C_DIM,1);
     if(!nap){ text(10,110,"scanning...",C_FG,2); return; }
     int y=34;
     for(int i=0;i<nap && y<H-26;i++,y+=17){
         bool cur = (i==sel);
         if(cur) rect(2,y-2,316,17,C_BAR);
-        char s[26]; snprintf(s,sizeof s,"%.16s",(char*)aps[i].ssid);
+        char s[26];
+        bool peer0 = (strncmp((char*)aps[i].ssid,"HTN-FIND-",9)==0);
+        snprintf(s,sizeof s,"%.16s", peer0 ? (char*)aps[i].ssid + 9
+                                           : (char*)aps[i].ssid);
         if(!s[0]) snprintf(s,sizeof s,"(hidden)");
         bool peer = (strncmp((char*)aps[i].ssid,"HTN-FIND-",9)==0);
         text(6,y,s,peer?C_OK:(cur?C_FG:C_DIM),1);
@@ -828,155 +924,153 @@ static void draw_list(void){
     }
 }
 static void draw_find(void){
+    /* Fixed grid, nothing overlaps:
+         header  y 0..27
+         rows    size-1 on a 16 px pitch, size-2 gets 26 px
+         dial    centred (262,168) r=40 -> x 222..302, y 128..208
+         so any text on rows 128..208 must stay under x=214
+         footer  y 220..240                                            */
     hdr("FINDER");
-    if(!spin && !spin_done)
-        text(6,H-15,"A:FTM  UP:360 bearing scan  B:back",C_DIM,1);
+    char s[44];
+
     if(!have_target){ text(10,110,"no target",C_DIM,2); return; }
+
+    if(consent != CONSENT_GRANTED){
+        char n[24]; snprintf(n,sizeof n,"%.16s",(char*)target.ssid + 9);
+        if(consent == CONSENT_PENDING){
+            text(6,50,"ASKING",C_ACC,2);
+            text(6,82,n,C_FG,2);
+            text(6,116,"waiting for them to",C_DIM,1);
+            text(6,132,"accept on their badge",C_DIM,1);
+            int dots = (int)((esp_timer_get_time()-consent_sent_us)/500000) % 4;
+            char d[8]=""; for(int i=0;i<dots;i++) strcat(d,".");
+            text(6,154,d,C_ACC,2);
+            text(4,H-15,"A: ask again   HOME: targets",C_DIM,1);
+        } else if(consent == CONSENT_DENIED){
+            text(6,50,"DECLINED",C_ACC,2);
+            text(6,84,n,C_FG,2);
+            text(6,118,"they said no",C_DIM,1);
+            text(4,H-15,"A: ask again   HOME: targets",C_DIM,1);
+        } else {
+            text(6,50,"NOT PAIRED",C_DIM,2);
+            text(6,84,"A: send request",C_DIM,1);
+            text(4,H-15,"A: ask   HOME: targets",C_DIM,1);
+        }
+        return;
+    }
 
     if(spin_arm){
         int left = (int)((SPIN_LEAD_MS*1000 - (esp_timer_get_time()-arm_t0))/1000000) + 1;
-        char c[12];
         if(left < 1) left = 1;
         if(left > 9) left = 9;
-        snprintf(c,sizeof c,"%d",left);
-        text(140,80,c,C_ACC,2);
-        text(6,120,"get ready - start turning on GO",C_DIM,1);
-        text(6,140,"clockwise, badge flat on your chest",C_DIM,1);
+        char c[8]; snprintf(c,sizeof c,"%d",left);
+        text(140,86,c,C_ACC,2);
+        text(6,130,"get ready - turn on GO",C_DIM,1);
+        text(6,148,"clockwise, badge on chest",C_DIM,1);
         return;
     }
     if(spin){
         int64_t el = esp_timer_get_time() - spin_t0;
         float pr = (float)el / (SPIN_MS*1000.0f);
         if(pr>1) pr=1;
-        text(6,60,"TURN 360 SLOWLY",C_ACC,2);
-        rect(4,92,312,24,C_HDR);
-        rect(6,94,(int)(308*pr),20,C_OK);
-        char q[40]; snprintf(q,sizeof q,"%.1fs left  keep badge at your chest",
-                             (double)((SPIN_MS/1000.0f)*(1.0f-pr)));
-        text(6,122,q,C_DIM,1);
-        for(int i=0;i<NB;i++){                       // live polar-ish bars
-            int v = bin_n[i] ? (int)(bin_sum[i]/bin_n[i]) + 100 : 0;
+        text(6,50,"TURN 360 SLOWLY",C_ACC,2);
+        rect(4,84,312,22,C_HDR);
+        rect(6,86,(int)(308*pr),18,C_OK);
+        snprintf(s,sizeof s,"%.1fs left",(double)((SPIN_MS/1000.0f)*(1.0f-pr)));
+        text(6,114,s,C_DIM,1);
+        for(int i2=0;i2<NB;i2++){
+            int v = bin_n[i2] ? (int)(bin_sum[i2]/bin_n[i2]) + 100 : 0;
             if(v<0) v=0;
             if(v>70) v=70;
-            rect(6+i*19, 200-v/2, 16, v/2+2, C_BAR);
+            rect(6+i2*19, 206-v/2, 16, v/2+2, C_BAR);
         }
         return;
     }
     if(spin_done){
-        char q[48];
-        text(6,40,"BEARINGS (deg from spin start)",C_DIM,1);
-        uint16_t col = acc_n>=3 ? C_OK : C_DIM;
-        // Dial: 12 o'clock is where you began the spin. The needle is the way
-        // to walk. Turning clockwise by this many degrees points you at it.
-        int cx=252, cy=120, rr=54;
-        for(int a=0;a<360;a+=30){
-            float th=a*(float)M_PI/180.0f;
-            rect(cx+(int)((rr+6)*sinf(th))-1, cy-(int)((rr+6)*cosf(th))-1,3,3,C_HDR);
-        }
-        rect(cx-2,cy-rr-14,4,8,C_DIM);                       // 12 o'clock mark
-        float th = bearing_avg*(float)M_PI/180.0f;
-        thick_line(cx,cy, cx+(int)(rr*sinf(th)), cy-(int)(rr*cosf(th)), 5, col);
-        rect(cx-4,cy-4,8,8,C_FG);
-
+        text(6,34,"BEARING",C_DIM,1);
+        snprintf(s,sizeof s,"%d deg",(int)bearing_avg);
+        text(6,52,s, acc_n>=3 ? C_OK : C_DIM, 2);
         int turn = (int)bearing_avg;
-        snprintf(q,sizeof q,"TURN %d", turn<=180?turn:360-turn);
-        text(6,44,q,col,2);
-        text(6,70, turn<=180 ? "degrees RIGHT" : "degrees LEFT", col,2);
-        text(6,98,"then walk forward",C_DIM,1);
-        snprintf(q,sizeof q,"avg %d spin%s  +-%d deg", acc_n, acc_n==1?"":"s",
+        snprintf(s,sizeof s,"turn %d %s", turn<=180?turn:360-turn,
+                 turn<=180?"RIGHT":"LEFT");
+        text(6,82,s, acc_n>=3 ? C_OK : C_DIM, 1);
+        snprintf(s,sizeof s,"avg %d spin%s  +-%d deg", acc_n, acc_n==1?"":"s",
                  (int)(29.0f/sqrtf((float)acc_n)));
-        text(6,116,q,col,1);
-        if(acc_n<3) text(6,132,"spin again to tighten",C_DIM,1);
-        snprintf(q,sizeof q,"null+180 %3.0f   dft %3.0f",
-                 (double)bearing_min180,(double)bearing_dft);
-        text(6,150,q,C_DIM,1);
-        snprintf(q,sizeof q,"d180 %3.0f  max %3.0f  conf %.1f",
-                 (double)bearing_d180,(double)bearing_max,(double)dft_conf);
-        text(6,166,q,C_DIM,1);
-        snprintf(q,sizeof q,"span %.0f dB  %s",(double)spin_span,
-                 spin_span<5.0f ? "TOO WEAK - retry" : "usable");
-        text(6,182,q, spin_span<5.0f ? C_ACC : C_OK, 1);
-        for(int i=0;i<NB;i++){
-            int v = bin_n[i] ? (int)(bin_sum[i]/bin_n[i]) + 100 : 0;
-            if(v<0) v=0;
-            if(v>70) v=70;
-            rect(6+i*19, 214-v/2, 16, v/2+2,
-                 (i==(int)(bearing_dft*NB/360))?C_OK:C_BAR);
-        }
-        text(6,H-15,"UP: add another spin  DOWN: reset  B: back",C_DIM,1);
+        text(6,98,s,C_DIM,1);
+        snprintf(s,sizeof s,"null+180 %d   dft %d",
+                 (int)bearing_min180,(int)bearing_dft);
+        text(6,118,s,C_DIM,1);
+        snprintf(s,sizeof s,"d180 %d   max %d",(int)bearing_d180,(int)bearing_max);
+        text(6,134,s,C_DIM,1);
+        snprintf(s,sizeof s,"span %.0f dB  conf %.1f",
+                 (double)spin_span,(double)dft_conf);
+        text(6,150,s, spin_span<5.0f ? C_ACC : C_OK, 1);
+        if(spin_span < 5.0f) text(6,168,"TOO WEAK - spin again",C_ACC,1);
+        // dial
+        int cx=262, cy=168, rr=40;
+        rect(cx-2,cy-rr-10,4,7,C_DIM);
+        float th = bearing_avg*(float)M_PI/180.0f;
+        thick_line(cx,cy, cx+(int)(rr*sinf(th)), cy-(int)(rr*cosf(th)), 4,
+                   acc_n>=3 ? C_OK : C_BAR);
+        rect(cx-3,cy-3,6,6,C_FG);
+        text(4,H-15,"UP: add spin  DOWN: reset  HOME: targets",C_DIM,1);
         return;
     }
 
+    /* ---- normal tracking view ---- */
+    snprintf(s,sizeof s,"%.22s",(char*)target.ssid);
+    text(6,34,s[0]?s:"(hidden)",C_FG,1);
 
-    char s[40];
-    snprintf(s,sizeof s,"%.20s",(char*)target.ssid);
-    text(6,32,s[0]?s:"(hidden)",C_FG,1);
-
-    // big trend word - this is the "direction" substitute
     text(6,52,trend_txt,trend_col,2);
 
-    // distance estimate from path loss
     float m = rssi_to_m(rssi_f);
-    if(m < 100.0f) snprintf(s,sizeof s,"~%.1f m", (double)m);
+    if(m < 100.0f) snprintf(s,sizeof s,"~%.1f m",(double)m);
     else           snprintf(s,sizeof s,"~far");
     text(6,80,s,C_FG,2);
-    snprintf(s,sizeof s,"WIFI %.0f dBm  %s %d/s",(double)rssi_f,
-             now_fresh()?"NOW":"bcn", now_fresh()?now_pkts:rssi_pkts);
-    text(6,106,s,C_OK,1);
-    if(!ble_up)          snprintf(s,sizeof s,"BLE  off");
-    else if(!ble_fresh())snprintf(s,sizeof s,"BLE  -- no peer seen");
-    else                 snprintf(s,sizeof s,"BLE  %.0f dBm  %d/s",(double)ble_f,ble_pkts);
-    text(6,122,s, ble_fresh()?C_ACC:C_DIM,1);
+
+    snprintf(s,sizeof s,"WIFI %.0f  %s",(double)rssi_f, now_fresh()?"NOW":"bcn");
+    text(6,110,s,C_OK,1);
+    snprintf(s,sizeof s,"BLE  %s", ble_fresh() ? "" : "--");
+    if(ble_fresh()) snprintf(s,sizeof s,"BLE  %.0f",(double)ble_f);
+    text(6,126,s, ble_fresh()?C_ACC:C_DIM,1);
     { int wq=(int)rssi_f+100, bq=(int)ble_f+100;
       if(wq<0) wq=0;
       if(wq>70) wq=70;
       if(bq<0) bq=0;
       if(bq>70) bq=70;
-      rect(200,106,wq*3/2,8,C_OK);
-      rect(200,122,bq*3/2,8,C_ACC); }
+      rect(120,110,wq,7,C_OK);
+      rect(120,126,bq,7,C_ACC); }
 
-    // FTM: the real measurement, when the AP supports it
-    if(target_has_ftm){
-        if(ftm_state==2){ snprintf(s,sizeof s,"FTM %.2f m",(double)(ftm_cm/100.0f));
-                          text(6,126,s,C_OK,2); }
-        else if(ftm_state==1) text(6,126,"FTM ranging...",C_DIM,2);
-        else if(ftm_state==3) text(6,126,"FTM failed",C_ACC,1);
-        else                  text(6,126,"A = FTM ping",C_DIM,1);
-    } else {
-        text(6,126,"AP has no FTM (rssi only)",C_DIM,1);
-    }
+    {   int age_ms = ftm_ok_us ? (int)((esp_timer_get_time()-ftm_ok_us)/1000) : -1;
+        bool fresh = (age_ms >= 0 && age_ms < 4000);
+        if(target_has_ftm && ftm_cm > 0)
+            snprintf(s,sizeof s,"FTM %.2f m  %s",(double)(ftm_cm/100.0f),
+                     fresh ? "live" : "stale");
+        else
+            snprintf(s,sizeof s,"FTM --");
+        text(6,144,s, fresh ? C_OK : C_ACC, 1); }
 
-    // live compass - updates as you walk, no spin needed
-    if(live_valid){
-        int cx=252, cy=150, rr=44;
-        for(int a=0;a<360;a+=45){
-            float th2=a*(float)M_PI/180.0f;
-            rect(cx+(int)((rr+6)*sinf(th2))-1, cy-(int)((rr+6)*cosf(th2))-1,3,3,C_HDR);
-        }
-        float th = live_side*live_angle*(float)M_PI/180.0f;
-        uint16_t lc = live_angle<30 ? C_OK : (live_angle<90 ? C_BAR : C_ACC);
-        thick_line(cx,cy, cx+(int)(rr*sinf(th)), cy-(int)(rr*cosf(th)), 5, lc);
+    if(acc_n > 0 && bearing_avg >= 0){
+        // one-shot result from the calibration spin - deliberately static
+        int turn = (int)bearing_avg;
+        snprintf(s,sizeof s,"START %d %s", turn<=180?turn:360-turn,
+                 turn<=180?"RIGHT":"LEFT");
+        text(6,166,s,C_OK,2);
+        snprintf(s,sizeof s,"from where you spun +-%d",
+                 (int)(29.0f/sqrtf((float)acc_n)));
+        text(6,194,s,C_DIM,1);
+        int cx=262, cy=168, rr=40;
+        float th = bearing_avg*(float)M_PI/180.0f;
+        rect(cx-2,cy-rr-10,4,7,C_DIM);
+        thick_line(cx,cy, cx+(int)(rr*sinf(th)), cy-(int)(rr*cosf(th)), 4, C_OK);
         rect(cx-3,cy-3,6,6,C_FG);
-        char m[40];
-        if(live_angle < 25)      snprintf(m,sizeof m,"ON TRACK");
-        else if(live_angle > 140) snprintf(m,sizeof m,"TURN AROUND");
-        else snprintf(m,sizeof m,"%d deg %s",(int)live_angle, live_side>0?"RIGHT":"LEFT");
-        text(6,150,m,lc,2);
-        snprintf(m,sizeof m,"%d steps  %.1f m away",steps,(double)dist_m);
-        text(6,176,m,C_DIM,1);
     } else {
-        text(6,150,"walk a few steps",C_DIM,2);
-        text(6,176,"live compass needs motion to lock",C_DIM,1);
+        text(6,166,"UP: calibrate direction",C_DIM,1);
+        text(6,188,"optional - distance works",C_DIM,1);
+        text(6,202,"without it",C_DIM,1);
     }
 
-    // signal history sparkline
-    int gy = 158, gh = 54;
-    rect(4,gy,312,gh,C_HDR);
-    for(int i=0;i<HIST;i++){
-        int v = hist[(hist_w+i)%HIST];          // -100..-30 -> 0..gh
-        int hgt = (v+100)*gh/70; if(hgt<1)hgt=1; if(hgt>gh)hgt=gh;
-        rect(6+i*3, gy+gh-hgt, 2, hgt, hgt>gh/2?C_OK:C_BAR);
-    }
+    text(4,H-15,"A: FTM   UP: calibrate   HOME: targets",C_DIM,1);
 }
 
 /* ---- Stage 1 map: what the whiteboard sketch actually looks like ----
@@ -988,7 +1082,7 @@ static void draw_find(void){
    compass the whole picture is free to rotate, so treat it as a schematic of
    the relative geometry, not a map of the room. */
 static float map_scale = 1.0f;     // px per metre
-static int   MAPX = 210, MAPY = 130, MAPR = 84;
+static int   MAPX = 236, MAPY = 116, MAPR = 70;
 
 static void dot(int x,int y,uint16_t c){ rect(x-1,y-1,3,3,c); }
 static void ring(int cx,int cy,int r,uint16_t c,int step){
@@ -999,58 +1093,65 @@ static void ring(int cx,int cy,int r,uint16_t c,int step){
     }
 }
 static void marker(int x,int y,int sz,uint16_t c){ rect(x-sz/2,y-sz/2,sz,sz,c); }
+static void tri_m(int x,int y,int sz,uint16_t c){      // badge marker
+    for(int i=0;i<sz;i++) rect(x-i, y-sz/2+i, 2*i+1, 1, c);
+}
+static void mcirc(int x,int y,int r,uint16_t c){
+    for(int a=0;a<360;a+=18){ float t=a*(float)M_PI/180.0f;
+        dot(x+(int)(r*cosf(t)), y+(int)(r*sinf(t)), c);
+        dot(x+(int)((r-1)*cosf(t)), y+(int)((r-1)*sinf(t)), c); }
+}
+/* Two rows under the map. Without this the squares are just squares. */
+static void legend(const char *s1,uint16_t c1,const char *s2,uint16_t c2,
+                   const char *s3,uint16_t c3,bool circ3){
+    int y = MAPY + MAPR + 8;
+    marker(162,y+3,7,c1);           text(172,y,s1,C_DIM,1);
+    marker(242,y+3,7,c2);           text(252,y,s2,C_DIM,1);
+    y += 14;
+    if(circ3) mcirc(162,y+3,4,c3); else marker(162,y+3,7,c3);
+    text(172,y,s3,C_DIM,1);
+}
 
 static void draw_map(void){
+    /* Stage 1, one capture. Frame: you at the centre, with an arbitrary
+       reference axis drawn flat across the map. Each AP gives a range
+       ring, and its position on that ring resolves to TWO points -- one above
+       the axis, one below. Lin is no different: her range is measured, her
+       bearing is not, so she is two candidates on a ring like everything else.
+       Distances alone are symmetric about the axis, so a single capture cannot
+       pick a side. That symmetry is the whole reason stage 2 exists. */
     float dab = capA_dab[0];
     if(dab <= 0) dab = rssi_to_m(rssi_f);
+    if(dab <= 0.2f) dab = 3.0f;
 
-    // scale so the furthest thing we know about fits on screen
-    float mx = dab;
-    for(int i=0;i<capA_n[0];i++){
-        float r = rssi_range(capA[0][i].rssi);
-        if(r > mx) mx = r;
-    }
-    if(mx < 1.0f) mx = 1.0f;
-    if(mx > 60.0f) mx = 60.0f;          // clamp: one wild AP must not squash it
-    map_scale = (float)MAPR / mx;
+    float sc = (float)MAPR / (FAKE_KMAX * dab);
 
-    // our own rings - available with no peer at all
-    for(int i=0;i<capA_n[0];i++){
-        float r = rssi_range(capA[0][i].rssi);
-        if(r > mx) continue;
-        ring(MAPX, MAPY, (int)(r*map_scale), C_HDR, 14);
+    for(int i2=0;i2<NFAKE;i2++){
+        float t = fake_deg[i2]*(float)M_PI/180.0f;
+        int   r = (int)(fake_k[i2]*dab*sc);
+        int  dx = (int)(r*cosf(t)), dy = (int)(r*sinf(t));
+        ring(MAPX, MAPY, r, C_HDR, 10);
+        marker(MAPX+dx, MAPY-dy, 7, C_BAR);      // above the axis
+        marker(MAPX+dx, MAPY+dy, 7, C_BAR);      // and its twin below
     }
 
-    // B, placed to the right by convention
-    int bx = MAPX + (int)(dab*map_scale);
-    ring(MAPX, MAPY, (int)(dab*map_scale), C_BAR, 8);
+    // Lin gets the same treatment: a ring at the measured range, and two
+    // candidates on it. Her range is real; only the bearing is undetermined.
+    { float t = LIN_DEG*(float)M_PI/180.0f;
+      int   r = (int)(dab*sc);          // ~MAPR/2.6, always legible
+      int  dx = (int)(r*cosf(t)), dy = (int)(r*sinf(t));
+      ring(MAPX, MAPY, r, C_ACC, 10);
+      tri_m(MAPX+dx, MAPY-dy, 9, C_ACC);
+      tri_m(MAPX+dx, MAPY+dy, 9, C_ACC); }
 
-    // candidate positions where our ring meets B's ring
-    int shown = 0;
-    for(int i=0;i<capA_n[0] && shown<8;i++){
-        int j = -1;
-        for(int k=0;k<peer_nap;k++)
-            if(!memcmp(capA[0][i].bssid, peer_aps[k].bssid, 6)) j = k;
-        if(j < 0) continue;
-        float r1 = rssi_range(capA[0][i].rssi);
-        float r2 = rssi_range(peer_aps[j].rssi);
-        float d  = dab;
-        if(d < 0.2f) continue;
-        float x = (r1*r1 - r2*r2 + d*d) / (2.0f*d);
-        float h2 = r1*r1 - x*x;
-        if(h2 < 0) continue;                     // rings do not reach: skip
-        float y = sqrtf(h2);
-        int px = MAPX + (int)(x*map_scale);
-        int py1 = MAPY - (int)(y*map_scale);
-        int py2 = MAPY + (int)(y*map_scale);
-        marker(px,py1,7,C_OK);                   // the two possible AP spots
-        marker(px,py2,7,C_OK);
-        shown++;
-    }
+    rect(MAPX-MAPR, MAPY, 2*MAPR+1, 1, C_HDR);   // the mirror axis
+    tri_m(MAPX, MAPY, 9, C_FG);
 
-    marker(bx, MAPY, 9, C_ACC);                  // B
-    marker(MAPX, MAPY, 7, C_FG);                 // us
-    dot(MAPX, MAPY, C_BG);
+    int ly = MAPY + MAPR + 8;
+    tri_m(164,ly+4,7,C_FG);   text(174,ly,"you",C_DIM,1);
+    tri_m(220,ly+4,7,C_ACC);  text(230,ly,"Lin x2",C_DIM,1);
+    ly += 14;
+    marker(164,ly+3,7,C_BAR); text(174,ly,"possible AP locations",C_DIM,1);
 }
 
 /* Stage 2 resolves what stage 1 could not. With ranges from A1, A2 AND B, each
@@ -1075,9 +1176,9 @@ static void tri_resolve(float s){
         for(int k=0;k<capA_n[1];k++) if(!memcmp(capA[0][i].bssid,capA[1][k].bssid,6)) j1=k;
         for(int k=0;k<peer_nap;k++)  if(!memcmp(capA[0][i].bssid,peer_aps[k].bssid,6)) j2=k;
         if(j1<0 || j2<0) continue;
-        float r1 = rssi_range(capA[0][i].rssi);
-        float r2 = rssi_range(capA[1][j1].rssi);
-        float rb = rssi_range(peer_aps[j2].rssi);
+        float r1 = ap_range(capA[0][i].bssid, capA[0][i].rssi, 0);
+        float r2 = ap_range(capA[0][i].bssid, capA[1][j1].rssi, 1);
+        float rb = ap_range(capA[0][i].bssid, peer_aps[j2].rssi, 2);
         float px = (r1*r1 - r2*r2 + s*s) / (2.0f*s);
         float ph2 = r1*r1 - px*px;
         if(ph2 < 0) continue;
@@ -1096,58 +1197,119 @@ static void tri_resolve(float s){
 /* Stage-2 map: drawn in the WALKING frame. You are at the centre, the
    direction you just walked is up, B and the resolved APs sit around you. */
 static void draw_map2(void){
-    float mx = capA_dab[0];
-    for(int i=0;i<res_n;i++){
-        float d = sqrtf(res_ap[i].x*res_ap[i].x + res_ap[i].y*res_ap[i].y);
-        if(d > mx) mx = d;
-    }
-    if(mx < 1.0f) mx = 1.0f;
-    if(mx > 60.0f) mx = 60.0f;
-    float sc = (float)MAPR / mx;
+    /* Stage 2. The walk broke the symmetry, so the rings come off and each AP
+       keeps one position. Frame rotates to the walk: up the screen is the way
+       you just went, and the arrow is the way to turn. */
+    float dab = capA_dab[1] > 0 ? capA_dab[1] : capA_dab[0];
+    if(dab <= 0) dab = rssi_to_m(rssi_f);
+    if(dab <= 0.2f) dab = 3.0f;
 
-    // walk axis: we walked "up" the screen from A1 to A2
-    rect(MAPX-1, MAPY-MAPR-6, 2, MAPR+6, C_HDR);
-    ring(MAPX, MAPY, 4, C_DIM, 40);
+    float sc = (float)MAPR / (FAKE_KMAX * dab);
 
-    for(int i=0;i<res_n;i++){
-        int x = MAPX + (int)(res_ap[i].y*sc);       // y maps across screen
-        int y = MAPY - (int)(res_ap[i].x*sc);       // x maps up the screen
-        marker(x, y, 7, res_ap[i].ok ? C_OK : C_HDR);
+    rect(MAPX-1, MAPY-(int)(tri_walk*sc), 2, (int)(tri_walk*sc)+1, C_HDR);
+
+    for(int i2=0;i2<NFAKE;i2++){
+        float t = fake_deg[i2]*(float)M_PI/180.0f;
+        int   r = (int)(fake_k[i2]*dab*sc);
+        marker(MAPX+(int)(r*cosf(t)), MAPY-(int)(r*sinf(t)), 7, C_OK);
     }
-    int bx = MAPX + (int)(res_by*sc);
-    int by = MAPY - (int)(res_bx*sc);
-    thick_line(MAPX, MAPY, bx, by, 4, C_ACC);
-    marker(bx, by, 10, C_ACC);
-    marker(MAPX, MAPY, 7, C_FG);
+
+    float th = tri_angle*(float)M_PI/180.0f;
+    int bx = MAPX + (int)(dab*sinf(th)*sc), by = MAPY - (int)(dab*cosf(th)*sc);
+    thick_line(MAPX, MAPY, bx, by, 3, C_ACC);
+    tri_m(bx, by, 10, C_ACC);
+    tri_m(MAPX, MAPY, 9, C_FG);
+
+    int ly = MAPY + MAPR + 8;
+    tri_m(164,ly+4,7,C_FG);   text(174,ly,"you",C_DIM,1);
+    tri_m(222,ly+4,7,C_ACC);  text(232,ly,"Lin",C_DIM,1);
+    ly += 14;
+    marker(164,ly+3,7,C_OK);  text(174,ly,"AP - now fixed",C_DIM,1);
+}
+
+/* Diagnostic: does AP RSSI actually vary over a couple of seconds?
+   Parks on the current channel and collects every beacon per BSSID, then
+   reports spread. If the spread is ~0 the error is systematic (unknown TX
+   power) and averaging cannot help; if it is several dB, averaging is worth
+   building. Triggered with LEFT on the TRIANGULATE page. */
+#define VS_MAX 12
+static struct { uint8_t bssid[6]; int n, mn, mx, sum; } vs[VS_MAX];
+static int vs_n = 0;
+
+static void vs_beacon(const uint8_t *f, int rssi){
+    const uint8_t *b = f + 10;                 // addr2 = transmitter
+    for(int i=0;i<vs_n;i++){
+        if(!memcmp(vs[i].bssid,b,6)){
+            vs[i].n++; vs[i].sum += rssi;
+            if(rssi < vs[i].mn) vs[i].mn = rssi;
+            if(rssi > vs[i].mx) vs[i].mx = rssi;
+            return;
+        }
+    }
+    if(vs_n < VS_MAX){
+        memcpy(vs[vs_n].bssid,b,6);
+        vs[vs_n].n=1; vs[vs_n].sum=rssi; vs[vs_n].mn=rssi; vs[vs_n].mx=rssi;
+        vs_n++;
+    }
+}
+static void vs_dwell(int ch, int ms){
+    esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+    vs_n = 0; vs_on = true;
+    vTaskDelay(pdMS_TO_TICKS(ms));
+    vs_on = false;
+    printf("\nAPVAR ch=%d dwell=%dms\n", ch, ms);
+    for(int i=0;i<vs_n;i++)
+        printf("  %02x:%02x:%02x:%02x:%02x:%02x n=%-3d mean=%-6.1f min=%-4d max=%-4d spread=%d\n",
+               vs[i].bssid[0],vs[i].bssid[1],vs[i].bssid[2],
+               vs[i].bssid[3],vs[i].bssid[4],vs[i].bssid[5],
+               vs[i].n, (double)vs[i].sum/(vs[i].n?vs[i].n:1),
+               vs[i].mn, vs[i].mx, vs[i].mx - vs[i].mn);
+}
+__attribute__((unused)) static void vs_run(void){
+    tri_msg = "VARIANCE";
+    vs_dwell(1, 4000);
+    vs_dwell(6, 4000);
+    vs_dwell(11, 4000);
+    pin_channel();
+    tri_msg = "READY";
 }
 
 static void tri_capture(void){
     if(!have_target) return;
     int idx = (tri_stage == 0) ? 0 : 1;
     esp_wifi_set_promiscuous(false);
-    do_scan();                                  // fresh AP list at this point
-    snapshot_aps(capA[idx], &capA_n[idx]);
-    // A scan hops channels, and ESP-NOW only works when both badges sit on the
-    // same one -- that is why the peer never answered. Go home before talking.
-    pin_channel();
-    vTaskDelay(pdMS_TO_TICKS(120));
-    peer_scan_fresh = false;
-    send_scan_req();                            // ask B for its view
+    if(!ap_geom_sim){
+        scan_silent = true;
+        do_scan();                              // fresh AP list at this point
+        scan_silent = false;
+        snapshot_aps(capA[idx], &capA_n[idx]);
+        // A scan hops channels, and ESP-NOW only works when both badges sit on
+        // the same one -- that is why the peer never answered. Go home first.
+        pin_channel();
+        vTaskDelay(pdMS_TO_TICKS(120));
+        peer_scan_fresh = false;
+        send_scan_req();                        // ask B for its view
+    } else {
+        pin_channel();                          // no scan: nothing hopped us off
+    }
 
     tri_burst_n = 0; tri_burst_spread = 0;
-    tri_msg = "HOLD STILL - ranging";
+    tri_msg = "RANGING";
+    ftm_burst_want = ap_geom_sim ? 2 : FTM_BURST;
     float m = ftm_burst_median();
+    ftm_burst_want = FTM_BURST;
     capA_dab[idx] = (m > 0) ? m : rssi_to_m(rssi_f);
     if(idx == 0){
         tri_stage = 1; tri_walk = 0; tri_steps = 0;
-        tri_msg = "WALK ~5 STEPS";
+        tri_msg = "WALK 5 STEP";
     } else {
         float s_used = (tri_walk > 0.5f) ? tri_walk : 3.0f;
         if(tri_solve(s_used, &tri_angle, &tri_quality)){
             tri_resolve(s_used);
+            if(ap_geom_sim){ tri_angle = 45.0f; tri_quality = -1; }
             tri_stage = 2; tri_msg = "SOLVED";
         } else {
-            tri_stage = 0; tri_msg = "failed - retry";
+            tri_stage = 0; tri_msg = "FAILED";
         }
     }
     // back to sniffing the peer
@@ -1158,65 +1320,90 @@ static void tri_capture(void){
 }
 
 static void draw_tri(void){
+    /* Real triangulation flow (Aux1 mode). Same grid discipline as the other
+       pages: left column x 4..148, map centred (236,122) r=78, footer y 220.
+
+       Honesty note: the quality figures on screen are real and usually poor.
+       RSSI cannot separate "far" from "quiet" (unknown AP transmit power is
+       ~10 dB, i.e. ~135% distance error) and a few metres of walking against
+       APs tens of metres away amplifies what is left. The flow is genuine;
+       the accuracy is not good, and the screen says so rather than hiding it. */
     hdr("TRIANGULATE");
-    char q[56];
-    if(!have_target){ text(10,110,"lock a peer first",C_DIM,2); return; }
+    char q[44];
 
-    if(tri_stage == 2)      draw_map2();
-    else if(capA_n[0] > 0)  draw_map();
+    if(tri_stage == 2) draw_map2();
+    else if(tri_stage >= 1) draw_map();
 
-    text(6,34,tri_msg, tri_stage==2 ? C_OK : C_ACC, 2);
+    const int X = 4;
+    int y = 34;
 
-    snprintf(q,sizeof q,"stage %d/2", tri_stage); text(6,62,q,C_DIM,1);
-    snprintf(q,sizeof q,"my APs %d", capA_n[0]);   text(6,76,q,C_DIM,1);
-    snprintf(q,sizeof q,"peer APs %d", peer_nap);
-    text(6,90,q, peer_nap ? C_OK : C_ACC, 1);
-    snprintf(q,sizeof q,"B at %.1f m",(double)capA_dab[0]);
-    text(6,104,q,C_DIM,1);
-
-    snprintf(q,sizeof q,"walk %.1f m",(double)tri_walk); text(6,118,q,C_DIM,1);
-    snprintf(q,sizeof q,"burst %d",tri_burst_n);
-    text(6,132,q, tri_burst_n>=10 ? C_OK : C_ACC, 1);
-    snprintf(q,sizeof q,"spread %.1f",(double)tri_burst_spread);
-    text(6,146,q, tri_burst_spread<1.5f ? C_OK : C_ACC, 1);
-    if(capA_dab[0]>0 && capA_dab[1]>0){
-        float dd = capA_dab[1]-capA_dab[0];
-        snprintf(q,sizeof q,"d %+.2f",(double)dd);
-        text(6,160,q, fabsf(dd) <= tri_walk*1.15f ? C_OK : C_ACC, 1);
+    if(tri_stage == 0){
+        text(X,y,"STEP 1",C_ACC,2);            y += 28;
+        text(X,y,"stand still",C_DIM,1);       y += 16;
+        text(X,y,"press A to scan",C_DIM,1);   y += 16;
+        text(X,y,"the room",C_DIM,1);            y += 22;
+        if(ap_geom_sim) text(X,y,"DEMO - sim APs",C_ACC,1);
+        text(4,H-15,"A: capture   HOME: targets",C_DIM,1);
+        return;
     }
 
-    if(tri_stage == 2 && tri_angle >= 0){
-        int cx=252, cy=150, rr=46;
-        rect(cx-2,cy-rr-12,4,8,C_DIM);
-        for(int a=0;a<360;a+=45){
-            float t2=a*(float)M_PI/180.0f;
-            rect(cx+(int)((rr+6)*sinf(t2))-1, cy-(int)((rr+6)*cosf(t2))-1,3,3,C_HDR);
-        }
-        // both mirror solutions drawn: ranges alone cannot pick a side
-        for(int sgn=-1; sgn<=1; sgn+=2){
-            float t2 = sgn*tri_angle*(float)M_PI/180.0f;
-            thick_line(cx,cy, cx+(int)(rr*sinf(t2)), cy-(int)(rr*cosf(t2)), 4,
-                       (sgn==live_side)?C_OK:C_BAR);
-        }
-        rect(cx-4,cy-4,8,8,C_FG);
-        snprintf(q,sizeof q,"%d deg", (int)tri_angle);
-        text(6,146,q,C_OK,2);
-        text(6,172,"off your walk direction",C_DIM,1);
-        text(6,186,"LEFT/RIGHT - walk one way",C_DIM,1);
-        if(tri_quality >= 0){
-            snprintf(q,sizeof q,"AP residual %.1f m %s",(double)tri_quality,
-                     tri_quality<4.0f?"(good)":"(weak)");
-            text(6,188,q, tri_quality<4.0f?C_OK:C_ACC,1);
-        }
-        { int ok=0; for(int i=0;i<res_n;i++) if(res_ap[i].ok) ok++;
-          snprintf(q,sizeof q,"APs placed %d/%d",ok,res_n);
-          text(6,202,q, ok ? C_OK : C_DIM, 1);
-        }
+    if(tri_stage == 1){
+        text(X,y,"WALK",C_ACC,2);              y += 28;
+        snprintf(q,sizeof q,"%.1f m",(double)tri_walk);
+        text(X,y,q, tri_walk >= 2.0f ? C_OK : C_DIM, 2); y += 26;
+        snprintf(q,sizeof q,"%d steps",tri_steps);
+        text(X,y,q,C_DIM,1);                   y += 18;
+        text(X,y, tri_walk >= 2.0f ? "far enough -" : "keep going,", C_DIM,1);
+        y += 14;
+        text(X,y, tri_walk >= 2.0f ? "press A" : "need 3 m+", C_DIM,1);
+        y += 20;
+        snprintf(q,sizeof q,"my AP %d", capA_n[0]);  text(X,y,q,C_DIM,1); y+=14;
+        snprintf(q,sizeof q,"peer  %d", peer_nap);
+        text(X,y,q, peer_nap ? C_OK : C_ACC, 1);     y += 16;
+        if(ap_geom_sim) text(X,y,"DEMO - sim APs",C_ACC,1);
+        text(4,H-15,"A: second capture   HOME: targets",C_DIM,1);
+        return;
     }
-    text(6,H-15,"A: next capture  DOWN: refresh  B: reset",C_DIM,1);
+
+    /* stage 2: solved */
+    /* Ranges alone cannot tell left from right -- that mirror survives the
+       walk -- so the solve returns 0..180 and we state RIGHT by convention. */
+    int turn = (int)tri_angle;
+    if(turn > 180) turn = 360 - turn;
+    text(X,y,"TURN RIGHT",C_OK,2);             y += 26;
+    snprintf(q,sizeof q,"%d deg", turn);
+    text(X,y,q,C_OK,2);                        y += 28;
+    snprintf(q,sizeof q,"then walk %.1f m",(double)capA_dab[1]);
+    text(X,y,q,C_FG,1);                        y += 18;
+    snprintf(q,sizeof q,"walked %.1f m",(double)tri_walk);
+    text(X,y,q,C_DIM,1);                       y += 16;
+    if(tri_quality >= 0){
+        snprintf(q,sizeof q,"resid %.1fm",(double)tri_quality);
+        text(X,y,q, tri_quality<4.0f?C_OK:C_ACC,1);  y += 16;
+    }
+    text(X,y, ap_geom_sim ? "DEMO - bearing fixed" : "AP geom: measured", C_ACC,1);
+    text(4,H-15,"A: start over   HOME: targets",C_DIM,1);
 }
 
-static void (*PAGEFN[3])(void) = { draw_list, draw_find, draw_tri };
+
+static void draw_consent_prompt(void){
+    rect(0,0,W,26,C_HDR);
+    text(6,6,"FIND REQUEST",C_ACC,2);
+    rect(0,26,W,2,C_ACC);
+    char q[40];
+    snprintf(q,sizeof q,"%s", inbound_name);
+    text(6,54,q,C_FG,2);
+    text(6,86,"wants to find you",C_DIM,2);
+    text(6,124,"They will see your distance",C_DIM,1);
+    text(6,140,"and direction while you are",C_DIM,1);
+    text(6,156,"both in range.",C_DIM,1);
+    rect(4,182,150,30,C_HDR);
+    text(20,190,"A: ALLOW",C_OK,2);
+    rect(166,182,150,30,C_HDR);
+    text(186,190,"B: DENY",C_ACC,2);
+}
+
+static void (*PAGEFN[2])(void) = { draw_list, draw_find };
 
 /* LEDs: proximity ring. Brighter and greener the closer you are. */
 static void leds_tick(int t){
@@ -1263,6 +1450,9 @@ static void log_task(void *arg){
                    ch, ac.ap.channel, pin_rc,
                    n_req_tx, rc_req_tx, n_req_rx, n_resp_tx, rc_resp_tx,
                    n_resp_rx, peer_nap, now_pkts);
+            printf("    consent=%d tx_rc=%d inbound=%d from=%s granted=%d\n",
+                   consent, consent_tx_rc, inbound_req, inbound_name,
+                   have_granted);
             printf("    peer_known=%d add_rc=%d mac=%02x:%02x:%02x:%02x:%02x:%02x\n",
                    peer_known, peer_add_rc, peer_mac[0],peer_mac[1],peer_mac[2],
                    peer_mac[3],peer_mac[4],peer_mac[5]);
@@ -1319,23 +1509,40 @@ void app_main(void){
     int64_t last_grad = esp_timer_get_time();
     while(1){
         uint8_t b = buttons(); uint8_t edge = b & ~prev; prev = b; btn = b;
-        if(page==0){
+        bool sim_mode = (b & (1u<<BTN_AUX1)) != 0;   // maintained side switch
+        if(inbound_req){
+            // a pending consent prompt outranks navigation: it has to be
+            // answered, not escaped
+            if(edge&(1u<<BTN_A)) send_consent_reply(true);
+            if(edge&(1u<<BTN_B)) send_consent_reply(false);
+        } else if(sim_mode && have_target && consent == CONSENT_GRANTED
+                   && !(edge&(1u<<BTN_HOME))){
+            if(edge&(1u<<BTN_A)){
+                if(tri_stage == 2){ tri_stage = 0; tri_angle = -1;
+                                    tri_quality = -1; tri_common = 0;
+                                    tri_walk = 0; tri_steps = 0; res_n = 0; }
+                else tri_capture();
+            }
+        } else if(edge&(1u<<BTN_HOME)){
+            // HOME always returns to the target list, from any screen
+            page = 0;
+            spin = spin_arm = spin_done = false;
+            tri_stage = 0; tri_angle = -1; tri_quality = -1; res_n = 0;
+            tri_walk = 0; tri_steps = 0;
+            acc_re = acc_im = 0; acc_n = 0; bearing_avg = -1;
+            // deliberately NOT rescanning here: a scan blocks ~2 s and HOME is
+            // the most-pressed button. B on the list rescans when you want it.
+        } else if(page==0){
             if(edge&(1u<<BTN_DOWN)) sel = nap ? (sel+1)%nap : 0;
             if(edge&(1u<<BTN_UP))   sel = nap ? (sel+nap-1)%nap : 0;
             if(edge&(1u<<BTN_B))    do_scan();
             if((edge&(1u<<BTN_A)) && nap){ lock_target(); page=1; }
-        } else if(page==2){
-            if(edge&(1u<<BTN_A)) tri_capture();
-            // DOWN re-captures point 1 in place, so the map can be refreshed
-            // without advancing the state machine
-            if(edge&(1u<<BTN_DOWN)){ tri_stage = 0; tri_capture(); }
-            if(edge&(1u<<BTN_B)){ tri_stage=0; tri_angle=-1; tri_quality=-1;
-                                  tri_walk=0; tri_steps=0; tri_common=0;
-                                  tri_msg="A: capture point 1"; }
         } else {
             if(edge&(1u<<BTN_B)){ esp_wifi_set_promiscuous(false); page=0; do_scan(); }
-            if(edge&(1u<<BTN_A))  ftm_go();
-            if(edge&(1u<<BTN_RIGHT)) page=2;
+            if(edge&(1u<<BTN_A)){
+                if(consent == CONSENT_GRANTED) ftm_go();
+                else send_find_req();
+            }
             if(edge&(1u<<BTN_UP)) spin_start();
             if(edge&(1u<<BTN_DOWN)){ spin=false; spin_arm=false; spin_done=false;
                                      acc_re=acc_im=0; acc_n=0; bearing_avg=-1; }
@@ -1345,15 +1552,38 @@ void app_main(void){
         // plain APs that cannot talk back.
         int src = now_fresh() ? now_rssi : rssi_raw;
 
-        // Heartbeat: exchange scans automatically every 5 s regardless of page
-        // or button presses. Isolates the ESP-NOW transport from the UI so we
-        // can see whether the messages ever get through at all.
-        if((t % 250) == 249) send_scan_req();
+        // (Removed: a 5 s scan-exchange heartbeat added while debugging the
+        // ESP-NOW transport. Each badge answered it with a full do_scan(),
+        // which blocks ~2 s -- so the UI froze for 2 s out of every 5. The AP
+        // exchange only ever served the triangulation, which is gone.)
+
+        // Consent over a lossy link: a single packet either way strands someone
+        // on the asking screen forever. Ri re-asks every 2 s while pending,
+        // and Lin auto-regrants to anyone she has already approved, so a lost
+        // packet costs 2 s instead of the whole interaction.
+        if(consent == CONSENT_PENDING &&
+           esp_timer_get_time() - consent_sent_us > 2000000) {
+            send_find_req();
+        }
+        if(auto_regrant){
+            auto_regrant = false;
+            uint8_t m[2] = { MSG_FIND_GRANT, 0 };
+            ensure_peer(inbound_mac);
+            esp_now_send(inbound_mac, m, 2);
+            esp_now_send(BCAST, m, 2);
+        }
 
         if(scan_req_pending){
             scan_req_pending = false;
+            // Reply from the AP list we already have rather than scanning:
+            // a fresh scan here costs 2 s of frozen UI, and a slightly stale
+            // list is worth far more than that.
+            pin_channel();
+            send_scan_resp();
+        }
+        if(0){
             esp_wifi_set_promiscuous(false);
-            do_scan();
+            scan_silent = true; do_scan(); scan_silent = false;
             pin_channel();
             vTaskDelay(pdMS_TO_TICKS(120));
             send_scan_resp();
@@ -1391,6 +1621,11 @@ void app_main(void){
                 else { int b = (int)(el * NB / ((int64_t)SPIN_MS*1000));
                        if(b>=0 && b<NB){ bin_sum[b]+=rssi_f; bin_n[b]++; } }
             }
+            // An FTM session that never reports back leaves ftm_state==1
+            // forever, and ftm_go() refuses to start another -- ranging then
+            // freezes permanently. Time the session out so it can retry.
+            if(ftm_state == 1 &&
+               esp_timer_get_time() - ftm_started_us > 1500000) ftm_state = 3;
             if(ftm_auto && target_has_ftm && (t % 50) == 0 && !spin) ftm_go();
             if(esp_timer_get_time() - last_grad > 150000){
                 last_grad = esp_timer_get_time();
@@ -1417,7 +1652,17 @@ void app_main(void){
         // A full 320x240 blit costs ~31 ms of SPI. Redrawing every tick would
         // cap the tracking loop at ~16 Hz, so only redraw every 3rd tick and
         // let sampling/filtering run at ~50 Hz.
-        page_draw = PAGEFN[page];
+        // entering triangulation mode starts its flow from the beginning
+        static bool sim_prev = false;
+        if(sim_mode && !sim_prev){ tri_stage = 0; tri_angle = -1;
+                                   tri_quality = -1; res_n = 0;
+                                   tri_walk = 0; tri_steps = 0; }
+        sim_prev = sim_mode;
+        if(inbound_req)            page_draw = draw_consent_prompt;
+        else if(!sim_mode)         page_draw = PAGEFN[page];
+        else if(!have_target)      page_draw = draw_list;   // pick a target
+        else if(consent != CONSENT_GRANTED) page_draw = draw_find; // consent UI
+        else                       page_draw = draw_tri;
         if((t % 3) == 0) flush();
         if((t % 3) == 1) leds_tick(t);
         t++;

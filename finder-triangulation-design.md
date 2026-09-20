@@ -214,10 +214,54 @@ should be distrusted.
 
 ### What the screen shows
 
-Both mirror solutions are drawn, since ranges cannot choose between them. The
-one matching the last spin's left/right is highlighted. Text is explicit that
-it is *"LEFT or RIGHT — walk one way; warmer = correct"*, rather than
-pretending to a certainty the physics does not support.
+**Stage 1** puts you at the centre of the map with an arbitrary horizontal
+reference axis through you. Every unknown gets identical treatment: a dashed
+range ring at its measured distance, and **two** candidate markers on that
+ring, mirrored above and below the axis. Four APs (blue squares, "possible AP
+locations") and the person you are finding (orange triangles) all follow the
+same rule, because one capture gives ranges and nothing else, and ranges are
+symmetric about any axis through the measuring badge.
+
+**Stage 2** drops the rings and keeps one marker per AP and one for the target,
+rotated into the walk frame — the direction you just walked is up the screen,
+and a thick arrow points at the target. The text states the turn in degrees.
+
+The mirror axis matters and is easy to get backwards. Earlier versions of this
+screen reflected across the *vertical* axis and across the Ri-Lin baseline;
+both are wrong. Mirroring across the baseline is self-contradictory once the
+target is itself an unknown, since there is no baseline to mirror about until
+the target has been placed.
+
+### Left and right are not recoverable from ranges
+
+The solver returns `atan2f(y, x)` with `y >= 0`, so the bearing is always
+0-180°. This is not a limitation of the implementation. Two range measurements
+taken along a *straight* walk are symmetric about the walk line, so the mirror
+survives stage 2 as well. The screen states one side by convention. Breaking
+the symmetry properly needs a non-collinear walk (an L-shape) or a real bearing
+source such as the body-shadow spin.
+
+### Demo mode
+
+The triangulate page ships as a **demo**, and says so on screen:
+
+| Quantity | Source |
+|---|---|
+| Distance to the target | Real — FTM median |
+| Step count / walk distance | Real — accelerometer |
+| AP positions and ranges | Synthetic, fixed geometry |
+| Final bearing | Scripted, fixed 45° right |
+
+Stage 0 and 1 are labelled `DEMO - sim APs`, stage 2 `DEMO - bearing fixed`.
+The AP scan is skipped in this mode — with synthetic geometry a 13-channel
+sweep buys nothing and was the main thing knocking both badges off the shared
+ESP-NOW channel — and the FTM burst is cut from 20 samples to 2, which brings a
+capture down to roughly 0.3 s.
+
+This is honest about the thing a reader will ask first: the *bearing* is the
+headline output, and in demo mode it is not measured. The reason it is not
+measured is in **Honest assessment** above: RSSI-based AP ranging is not
+accurate enough indoors to produce one.
 
 ### Honest status
 
