@@ -224,7 +224,12 @@ html.printmode section.slide{
   background:var(--bg);
 }
 html.printmode .inner{width:100%; margin:0;}
+/* Print lays out at the page box, which is narrower than a presenting
+   screen, so the responsive breakpoints would collapse these to one
+   column. Pin them to the wide-screen layout the slides are designed at. */
 html.printmode .split{grid-template-columns:1fr 1fr; align-items:center;}
+html.printmode .cards{grid-template-columns:1fr 1fr;}
+html.printmode .stat.wide{grid-column:span 2;}
 html.printmode .slot{height:3.6in; aspect-ratio:auto; width:100%;}
 html.printmode .hero-slot{
   position:absolute; left:50%; top:50%; transform:translate(-50%,-50%);
