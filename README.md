@@ -6,6 +6,10 @@ away they are and which way to walk.
 
 Built during the event, replacing the stock firmware.
 
+**[Slides: how the indoor triangulation works](https://claude.ai/artifact/NurMfzXWSLegzPrbmA1wHB)** —
+walkthrough of the problem, the hardware, the two-stage method and where it
+breaks down.
+
 ## Why custom firmware
 
 The stock badge runs a Lua sandbox that exposes a deliberately restricted BLE
@@ -28,8 +32,11 @@ project depends on lives outside that sandbox:
 - **Direction** from a guided 360° scan. The badge is held against your chest;
   your body shadows the signal, and the resulting angular pattern is fitted to
   recover a bearing.
-- **Live compass** that keeps updating as you walk, without any compass
-  hardware — it infers your angle off-target from how fast the range closes.
+- **One-shot bearing calibration**, not a live compass. You spin once, it
+  tells you which way to start, and the reading then stays put. An adaptive
+  version that kept re-solving as you walked was tried and removed: gating it
+  on motion made the scatter worse, not better (16° → 42°, repeatability
+  18° → 104°).
 - **Warmer / colder** feedback and an LED proximity ring.
 - Works on any WiFi access point too, not just another badge.
 
