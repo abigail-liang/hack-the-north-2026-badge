@@ -910,7 +910,14 @@ addEventListener("keydown",e=>{
 document.getElementById("btnDown").addEventListener("click",()=>go(current+1));
 document.getElementById("btnUp").addEventListener("click",()=>go(current-1));
 
-/* ---------- print / PDF export ---------- */
+/* ---------- print / PDF export ----------
+   Every phase is drawn at t=1 (its finished state). The two ambient phases
+   loop on a pulse, so each names the timestamp it should be frozen at
+   (PHASES[].printNow) — deterministic, and caught where the ring reads well
+   rather than wherever the clock happened to be. */
+const PRINT_NOW=16499;
+PHASES[0].printNow=675;   /* hero: ping mid-flight, a soft ring behind the title */
+PHASES[7].printNow=385;   /* found: halo still tight around B */
 function preparePrint(){
   const html=document.documentElement;
   if(html.classList.contains("printmode")) return;
@@ -927,7 +934,7 @@ function preparePrint(){
     const ph=PHASES[SLIDE_PHASE[i]], cam=ph.cam, hh=cam[2]*(cv.height/cv.width);
     ph.draw(kit(cv.getContext("2d"),
       [cam[0]-cam[2],cam[0]+cam[2],cam[1]-hh,cam[1]+hh],
-      cv.width,cv.height), 1, performance.now());
+      cv.width,cv.height), 1, ph.printNow||PRINT_NOW);
   });
   sizeCrowd(); renderCrowd(1);
 }
@@ -953,6 +960,14 @@ bufferStage(r0);
 activate(0);
 moveStage(0,true);
 requestAnimationFrame(loop);
-if(location.search.includes("print")) requestAnimationFrame(()=>preparePrint());
+if(location.search.includes("print")){
+  /* the canvases draw text in IBM Plex — wait for the webfonts, or the labels
+     bake into the PDF in a fallback face and the slot metrics shift */
+  const fonts=(document.fonts && document.fonts.ready) || Promise.resolve();
+  fonts.then(()=>requestAnimationFrame(()=>requestAnimationFrame(()=>{
+    preparePrint();
+    document.documentElement.dataset.printReady="1";
+  })));
+}
 })();
 </script>
