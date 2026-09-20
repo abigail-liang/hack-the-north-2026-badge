@@ -1,3 +1,6 @@
+<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0">
 <title>Badge Finder</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap">
 <style>
@@ -220,8 +223,6 @@ html.printmode section.slide{
   break-after:page; page-break-after:always;
   padding:.45in .6in; box-sizing:border-box;
   display:flex; flex-direction:column; align-items:center; justify-content:center;
-  /* flat, opaque ground: the canvases paint the same colour, so no seam */
-  background:var(--bg);
 }
 html.printmode .inner{width:100%; margin:0;}
 html.printmode .split{grid-template-columns:1fr 1fr; align-items:center;}
@@ -985,3 +986,5 @@ if(location.search.includes("print")){
 }
 })();
 </script>
+
+</body></html>
