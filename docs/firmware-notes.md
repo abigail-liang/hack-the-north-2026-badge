@@ -125,3 +125,51 @@ table out of a flash dump rather than inferring it.
 One caveat: any firmware that brings up WiFi writes RF calibration data to
 `nvs`, so a backup taken afterwards differs from one taken before. Provisioning
 survives either way.
+
+## ESP-NOW between two badges: three traps
+
+Getting a reliable badge-to-badge link took far longer than the application
+code on top of it. Three separate causes, each of which silently produced
+"transmitted fine, never arrived".
+
+**1. A background scan destroys the link.** A WiFi scan sweeps all 13 channels
+and takes ~2 s. ESP-NOW only works while both ends sit on the *same* channel,
+so any periodic scan — even one added purely for debugging — makes a badge
+deaf for a large fraction of its life. Symptom: one direction works and the
+other does not, depending on which badge happens to be scanning. Scan only on
+explicit user action, and call `esp_wifi_set_channel()` on the way out.
+
+**2. Broadcast is only RECEIVED with promiscuous mode enabled.** With
+promiscuous off, `esp_now_send()` to `ff:ff:ff:ff:ff:ff` returned `ESP_OK`
+every time and nothing was ever received — same channel, both directions,
+verified with counters on both ends. Turning promiscuous mode on at boot fixed
+it instantly. Worth knowing because the failure gives no error at any layer.
+
+**3. Broadcast TX status is meaningless.** `ESP_NOW_SEND_SUCCESS` for a
+broadcast means the frame was transmitted, not that anything heard it — there
+is no acknowledgement for broadcast. So the send callback cannot tell you
+whether the link works. **Register the peer's actual MAC and unicast**: that
+is acknowledged at the MAC layer, so the status callback becomes a real
+delivery signal.
+
+### Debug it by measuring, not reasoning
+
+The channel was theorised about and "fixed" three times before anyone printed
+`esp_wifi_get_channel()`. The actual value found the bug in one reading:
+
+```
+badge A:  ch=1   apch=1      <- pinned
+badge B:  ch=5   apch=1      <- mid-scan, deaf
+```
+
+The other thing that paid for itself immediately was a counter on each message
+type at both ends:
+
+```
+NOW req_tx=5(rc0) req_rx=0 resp_tx=0 resp_rx=0 peerAP=0
+```
+
+That single line localises the break — sent-but-not-arrived, arrived-but-not-
+answered, or send failing outright — without any guessing. Add it before the
+first fix attempt, not after the third.
+

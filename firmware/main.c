@@ -254,9 +254,16 @@ static void promisc_cb(void *buf, wifi_promiscuous_pkt_type_t type){
 #define FIND_CHAN 1
 static char my_ssid[20];
 
+static volatile int ftm_seq = 0;   // bumped by the FTM report handler
+static int pin_rc = -99;
+static void pin_channel(void){        // both badges must share a channel for
+    pin_rc = esp_wifi_set_channel(NOW_CHAN, WIFI_SECOND_CHAN_NONE); // ESP-NOW
+}
 static int   tri_stage = 0;      // 0 idle, 1 captured A1, 2 solved
 static float tri_walk = 0;       // baseline walked between captures, m
 static int   tri_steps = 0;
+static int   tri_burst_n = 0;
+static float tri_burst_spread = 0;
 
 /* forward decls: the ESP-NOW rx callback below handles triangulation control
    messages, but the triangulation state lives further down the file. */
@@ -266,6 +273,10 @@ static ap_ent_t peer_aps[MAXPEERAP];
 static int peer_nap = 0;
 static volatile bool peer_scan_fresh = false;
 static volatile bool scan_req_pending = false;
+static volatile int n_req_rx=0, n_resp_rx=0;      // what this badge received
+static int n_req_tx=0, n_resp_tx=0;               // what it sent
+static int rc_req_tx=-99, rc_resp_tx=-99, peer_add_rc=-99;
+static uint8_t peer_mac_g[6];         // esp_now_send return codes
 
 /* ---- ESP-NOW ranging: no 102 ms beacon floor, so we can sample at 50 Hz ---- */
 static uint8_t BCAST[6] = {0xff,0xff,0xff,0xff,0xff,0xff};
@@ -276,8 +287,14 @@ static uint8_t peer_mac[6];
 static bool peer_known = false;
 
 static void now_rx(const esp_now_recv_info_t *i, const uint8_t *d, int len){
-    if(len >= 2 && d[0] == 0xA1){ scan_req_pending = true; return; }
+    if(len >= 2 && d[0] == 0xA1){
+        n_req_rx++;
+        if(!peer_known){ memcpy(peer_mac, i->src_addr, 6); }
+        memcpy(peer_mac_g, i->src_addr, 6);
+        scan_req_pending = true; return;
+    }
     if(len >= 2 && d[0] == 0xA2){
+        n_resp_rx++;
         int n = d[1]; if(n > 16) n = 16;
         if(len >= 2 + n*7){
             memcpy(peer_aps, d+2, n*7);
@@ -293,7 +310,7 @@ static void now_rx(const esp_now_recv_info_t *i, const uint8_t *d, int len){
 static void espnow_up(void){
     if(esp_now_init() != ESP_OK) return;
     esp_now_register_recv_cb(now_rx);
-    esp_now_peer_info_t p = { .channel = 0, .ifidx = WIFI_IF_AP, .encrypt = false };
+    esp_now_peer_info_t p = { .channel = 0, .ifidx = WIFI_IF_STA, .encrypt = false };
     memcpy(p.peer_addr, BCAST, 6);
     esp_now_add_peer(&p);
 }
@@ -343,6 +360,15 @@ static void do_scan(void){
     int ftm_ap = 0;
     for(int i=0;i<nap;i++) if(aps[i].ftm_responder) ftm_ap++;
     (void)ftm_ap;
+    // A scan hops every channel and leaves us on the last one. ESP-NOW only
+    // works when both badges sit on the SAME channel, so always come home --
+    // otherwise a badge idling on the target list (which auto-rescans) drifts
+    // away and silently stops hearing its peer.
+    pin_channel();
+    {   wifi_promiscuous_filter_t f = { .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT };
+        esp_wifi_set_promiscuous_filter(&f);
+        esp_wifi_set_promiscuous_rx_cb(promisc_cb);
+        esp_wifi_set_promiscuous(true); }
 }
 static void lock_target(void){
     target = aps[sel];
@@ -354,6 +380,16 @@ static void lock_target(void){
     // park on the target's channel and sniff its beacons
     memcpy(peer_mac, target.bssid, 6);
     peer_known = (strncmp((char*)target.ssid,"HTN-FIND-",9)==0);
+    if(peer_known){
+        // Unicast is acknowledged at the MAC layer, so esp_now_send's status
+        // callback becomes meaningful. Broadcast reports success regardless of
+        // whether anything heard it, which is why this was so hard to debug.
+        esp_now_peer_info_t up = { .channel = NOW_CHAN, .ifidx = WIFI_IF_STA,
+                                   .encrypt = false };
+        memcpy(up.peer_addr, peer_mac, 6);
+        if(esp_now_is_peer_exist(peer_mac)) esp_now_del_peer(peer_mac);
+        peer_add_rc = esp_now_add_peer(&up);
+    }
     now_last_us = 0;
     esp_wifi_set_channel(target.primary, WIFI_SECOND_CHAN_NONE);
     wifi_promiscuous_filter_t filt = { .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT };
@@ -364,6 +400,7 @@ static void lock_target(void){
 static void ftm_evt(void *arg, esp_event_base_t base, int32_t id, void *data){
     if(id != WIFI_EVENT_FTM_REPORT) return;
     wifi_event_ftm_report_t *r = (wifi_event_ftm_report_t*)data;
+    ftm_seq++;
     if(r->status == FTM_STATUS_SUCCESS){
         // Multipath can only ever make the estimate LONGER, never shorter, and
         // a human cannot close 1.5 m/s. Reject physically impossible jumps.
@@ -513,6 +550,40 @@ static void ble_init(void){
 }
 
 
+
+/* Only the DIFFERENCE between the two captures matters, so FTM's constant
+   bias cancels and we are left with random noise -- which averages down.
+   A single reading (the old behaviour) was the worst possible estimator:
+   1/20th of the available information, and sometimes a stale global. */
+#define FTM_BURST 20
+static float ftm_burst_median(void){
+    float v[FTM_BURST]; int n = 0;
+    int64_t deadline = esp_timer_get_time() + 12000000;   // 12 s cap
+    while(n < FTM_BURST && esp_timer_get_time() < deadline){
+        int seq0 = ftm_seq;
+        ftm_state = 0;
+        ftm_go();
+        int64_t t0 = esp_timer_get_time();
+        while(ftm_seq == seq0 && esp_timer_get_time() - t0 < 500000)
+            vTaskDelay(pdMS_TO_TICKS(10));
+        if(ftm_seq != seq0 && ftm_cm > 0){
+            v[n++] = ftm_cm / 100.0f;
+            tri_burst_n = n;
+        }
+    }
+    if(n == 0) return -1;
+    for(int i=1;i<n;i++){                  // insertion sort, n<=20
+        float k=v[i]; int j=i-1;
+        while(j>=0 && v[j]>k){ v[j+1]=v[j]; j--; }
+        v[j+1]=k;
+    }
+    tri_burst_spread = v[n-1] - v[0];
+    printf("BURST n=%d min=%.2f max=%.2f med=%.2f raw=", n,(double)v[0],
+           (double)v[n-1], (double)((n&1)?v[n/2]:0.5f*(v[n/2-1]+v[n/2])));
+    for(int i=0;i<n;i++) printf("%.2f%s", (double)v[i], i<n-1?",":"\n");
+    return (n & 1) ? v[n/2] : 0.5f*(v[n/2-1] + v[n/2]);
+}
+
 /* ================= AP TRIANGULATION =================
    Two badges, plus the building's access points as shared reference points.
 
@@ -555,12 +626,17 @@ static void snapshot_aps(ap_ent_t *dst, int *n){
 }
 static void send_scan_req(void){
     scanmsg_t m; m.type = MSG_SCAN_REQ; m.n = 0;
-    esp_now_send(BCAST, (uint8_t*)&m, 2);
+    const uint8_t *dst = peer_known ? peer_mac : BCAST;
+    rc_req_tx = esp_now_send(dst, (uint8_t*)&m, 2);
+    n_req_tx++;
 }
 static void send_scan_resp(void){
     scanmsg_t m; m.type = MSG_SCAN_RESP;
     int n; snapshot_aps(m.e, &n); m.n = (uint8_t)n;
-    esp_now_send(BCAST, (uint8_t*)&m, 2 + n*sizeof(ap_ent_t));
+    // reply to whoever asked; fall back to broadcast if we have no lock
+    const uint8_t *dst = peer_known ? peer_mac : BCAST;
+    rc_resp_tx = esp_now_send(dst, (uint8_t*)&m, 2 + n*sizeof(ap_ent_t));
+    n_resp_tx++;
 }
 
 /* Solve for B's bearing in the walking frame.
@@ -903,22 +979,172 @@ static void draw_find(void){
     }
 }
 
+/* ---- Stage 1 map: what the whiteboard sketch actually looks like ----
+   A at the centre. One dotted ring per AP at its RSSI-derived range. When the
+   peer has replied we also intersect each AP's ring with B's, giving the two
+   candidate positions per AP (squares) and B's own two candidates (triangles).
+
+   The map is drawn with B placed to the RIGHT purely by convention -- with no
+   compass the whole picture is free to rotate, so treat it as a schematic of
+   the relative geometry, not a map of the room. */
+static float map_scale = 1.0f;     // px per metre
+static int   MAPX = 210, MAPY = 130, MAPR = 84;
+
+static void dot(int x,int y,uint16_t c){ rect(x-1,y-1,3,3,c); }
+static void ring(int cx,int cy,int r,uint16_t c,int step){
+    if(r < 2) return;
+    for(int a=0;a<360;a+=step){
+        float t=a*(float)M_PI/180.0f;
+        dot(cx+(int)(r*cosf(t)), cy+(int)(r*sinf(t)), c);
+    }
+}
+static void marker(int x,int y,int sz,uint16_t c){ rect(x-sz/2,y-sz/2,sz,sz,c); }
+
+static void draw_map(void){
+    float dab = capA_dab[0];
+    if(dab <= 0) dab = rssi_to_m(rssi_f);
+
+    // scale so the furthest thing we know about fits on screen
+    float mx = dab;
+    for(int i=0;i<capA_n[0];i++){
+        float r = rssi_range(capA[0][i].rssi);
+        if(r > mx) mx = r;
+    }
+    if(mx < 1.0f) mx = 1.0f;
+    if(mx > 60.0f) mx = 60.0f;          // clamp: one wild AP must not squash it
+    map_scale = (float)MAPR / mx;
+
+    // our own rings - available with no peer at all
+    for(int i=0;i<capA_n[0];i++){
+        float r = rssi_range(capA[0][i].rssi);
+        if(r > mx) continue;
+        ring(MAPX, MAPY, (int)(r*map_scale), C_HDR, 14);
+    }
+
+    // B, placed to the right by convention
+    int bx = MAPX + (int)(dab*map_scale);
+    ring(MAPX, MAPY, (int)(dab*map_scale), C_BAR, 8);
+
+    // candidate positions where our ring meets B's ring
+    int shown = 0;
+    for(int i=0;i<capA_n[0] && shown<8;i++){
+        int j = -1;
+        for(int k=0;k<peer_nap;k++)
+            if(!memcmp(capA[0][i].bssid, peer_aps[k].bssid, 6)) j = k;
+        if(j < 0) continue;
+        float r1 = rssi_range(capA[0][i].rssi);
+        float r2 = rssi_range(peer_aps[j].rssi);
+        float d  = dab;
+        if(d < 0.2f) continue;
+        float x = (r1*r1 - r2*r2 + d*d) / (2.0f*d);
+        float h2 = r1*r1 - x*x;
+        if(h2 < 0) continue;                     // rings do not reach: skip
+        float y = sqrtf(h2);
+        int px = MAPX + (int)(x*map_scale);
+        int py1 = MAPY - (int)(y*map_scale);
+        int py2 = MAPY + (int)(y*map_scale);
+        marker(px,py1,7,C_OK);                   // the two possible AP spots
+        marker(px,py2,7,C_OK);
+        shown++;
+    }
+
+    marker(bx, MAPY, 9, C_ACC);                  // B
+    marker(MAPX, MAPY, 7, C_FG);                 // us
+    dot(MAPX, MAPY, C_BG);
+}
+
+/* Stage 2 resolves what stage 1 could not. With ranges from A1, A2 AND B, each
+   AP's mirror pair collapses to the candidate whose distance to B matches what
+   B reported. The GLOBAL reflection (is everything above or below the walk
+   axis?) stays unresolvable -- that is a symmetry of distance data, not a gap
+   in it -- so we fix B above the axis by convention and resolve everything
+   else relative to that. */
+#define MAXRES 8
+static struct { float x, y; bool ok; } res_ap[MAXRES];
+static int res_n = 0;
+static float res_bx = 0, res_by = 0;
+
+static void tri_resolve(float s){
+    res_n = 0;
+    float ang = tri_angle * (float)M_PI/180.0f;
+    res_bx = capA_dab[0]*cosf(ang);
+    res_by = capA_dab[0]*sinf(ang);
+
+    for(int i=0;i<capA_n[0] && res_n<MAXRES;i++){
+        int j1=-1, j2=-1;
+        for(int k=0;k<capA_n[1];k++) if(!memcmp(capA[0][i].bssid,capA[1][k].bssid,6)) j1=k;
+        for(int k=0;k<peer_nap;k++)  if(!memcmp(capA[0][i].bssid,peer_aps[k].bssid,6)) j2=k;
+        if(j1<0 || j2<0) continue;
+        float r1 = rssi_range(capA[0][i].rssi);
+        float r2 = rssi_range(capA[1][j1].rssi);
+        float rb = rssi_range(peer_aps[j2].rssi);
+        float px = (r1*r1 - r2*r2 + s*s) / (2.0f*s);
+        float ph2 = r1*r1 - px*px;
+        if(ph2 < 0) continue;
+        float py = sqrtf(ph2);
+        // two candidates: (px, +py) and (px, -py). Pick the one whose distance
+        // to B agrees with B's own measurement -- this is what stage 2 buys.
+        float e_up = fabsf(sqrtf((px-res_bx)*(px-res_bx)+( py-res_by)*( py-res_by)) - rb);
+        float e_dn = fabsf(sqrtf((px-res_bx)*(px-res_bx)+(-py-res_by)*(-py-res_by)) - rb);
+        res_ap[res_n].x = px;
+        res_ap[res_n].y = (e_up <= e_dn) ? py : -py;
+        res_ap[res_n].ok = (fminf(e_up,e_dn) < 6.0f);
+        res_n++;
+    }
+}
+
+/* Stage-2 map: drawn in the WALKING frame. You are at the centre, the
+   direction you just walked is up, B and the resolved APs sit around you. */
+static void draw_map2(void){
+    float mx = capA_dab[0];
+    for(int i=0;i<res_n;i++){
+        float d = sqrtf(res_ap[i].x*res_ap[i].x + res_ap[i].y*res_ap[i].y);
+        if(d > mx) mx = d;
+    }
+    if(mx < 1.0f) mx = 1.0f;
+    if(mx > 60.0f) mx = 60.0f;
+    float sc = (float)MAPR / mx;
+
+    // walk axis: we walked "up" the screen from A1 to A2
+    rect(MAPX-1, MAPY-MAPR-6, 2, MAPR+6, C_HDR);
+    ring(MAPX, MAPY, 4, C_DIM, 40);
+
+    for(int i=0;i<res_n;i++){
+        int x = MAPX + (int)(res_ap[i].y*sc);       // y maps across screen
+        int y = MAPY - (int)(res_ap[i].x*sc);       // x maps up the screen
+        marker(x, y, 7, res_ap[i].ok ? C_OK : C_HDR);
+    }
+    int bx = MAPX + (int)(res_by*sc);
+    int by = MAPY - (int)(res_bx*sc);
+    thick_line(MAPX, MAPY, bx, by, 4, C_ACC);
+    marker(bx, by, 10, C_ACC);
+    marker(MAPX, MAPY, 7, C_FG);
+}
+
 static void tri_capture(void){
     if(!have_target) return;
     int idx = (tri_stage == 0) ? 0 : 1;
     esp_wifi_set_promiscuous(false);
     do_scan();                                  // fresh AP list at this point
     snapshot_aps(capA[idx], &capA_n[idx]);
-    capA_dab[idx] = (target_has_ftm && ftm_cm > 0) ? ftm_cm/100.0f
-                                                   : rssi_to_m(rssi_f);
+    // A scan hops channels, and ESP-NOW only works when both badges sit on the
+    // same one -- that is why the peer never answered. Go home before talking.
+    pin_channel();
+    vTaskDelay(pdMS_TO_TICKS(120));
     peer_scan_fresh = false;
     send_scan_req();                            // ask B for its view
+
+    tri_burst_n = 0; tri_burst_spread = 0;
+    tri_msg = "HOLD STILL - ranging";
+    float m = ftm_burst_median();
+    capA_dab[idx] = (m > 0) ? m : rssi_to_m(rssi_f);
     if(idx == 0){
         tri_stage = 1; tri_walk = 0; tri_steps = 0;
         tri_msg = "WALK ~5 STEPS";
     } else {
         float s_used = (tri_walk > 0.5f) ? tri_walk : 3.0f;
         if(tri_solve(s_used, &tri_angle, &tri_quality)){
+            tri_resolve(s_used);
             tri_stage = 2; tri_msg = "SOLVED";
         } else {
             tri_stage = 0; tri_msg = "failed - retry";
@@ -936,16 +1162,28 @@ static void draw_tri(void){
     char q[56];
     if(!have_target){ text(10,110,"lock a peer first",C_DIM,2); return; }
 
+    if(tri_stage == 2)      draw_map2();
+    else if(capA_n[0] > 0)  draw_map();
+
     text(6,34,tri_msg, tri_stage==2 ? C_OK : C_ACC, 2);
 
-    snprintf(q,sizeof q,"stage %d/2   peer APs %d   common %d",
-             tri_stage, peer_nap, tri_common);
-    text(6,64,q,C_DIM,1);
-    snprintf(q,sizeof q,"A1 range %.1f m   A2 range %.1f m",
-             (double)capA_dab[0], (double)capA_dab[1]);
-    text(6,80,q,C_DIM,1);
-    snprintf(q,sizeof q,"walked %.1f m  (%d steps)",(double)tri_walk,tri_steps);
-    text(6,96,q,C_DIM,1);
+    snprintf(q,sizeof q,"stage %d/2", tri_stage); text(6,62,q,C_DIM,1);
+    snprintf(q,sizeof q,"my APs %d", capA_n[0]);   text(6,76,q,C_DIM,1);
+    snprintf(q,sizeof q,"peer APs %d", peer_nap);
+    text(6,90,q, peer_nap ? C_OK : C_ACC, 1);
+    snprintf(q,sizeof q,"B at %.1f m",(double)capA_dab[0]);
+    text(6,104,q,C_DIM,1);
+
+    snprintf(q,sizeof q,"walk %.1f m",(double)tri_walk); text(6,118,q,C_DIM,1);
+    snprintf(q,sizeof q,"burst %d",tri_burst_n);
+    text(6,132,q, tri_burst_n>=10 ? C_OK : C_ACC, 1);
+    snprintf(q,sizeof q,"spread %.1f",(double)tri_burst_spread);
+    text(6,146,q, tri_burst_spread<1.5f ? C_OK : C_ACC, 1);
+    if(capA_dab[0]>0 && capA_dab[1]>0){
+        float dd = capA_dab[1]-capA_dab[0];
+        snprintf(q,sizeof q,"d %+.2f",(double)dd);
+        text(6,160,q, fabsf(dd) <= tri_walk*1.15f ? C_OK : C_ACC, 1);
+    }
 
     if(tri_stage == 2 && tri_angle >= 0){
         int cx=252, cy=150, rr=46;
@@ -962,17 +1200,20 @@ static void draw_tri(void){
         }
         rect(cx-4,cy-4,8,8,C_FG);
         snprintf(q,sizeof q,"%d deg", (int)tri_angle);
-        text(6,120,q,C_OK,2);
-        text(6,148,"off your walk direction",C_DIM,1);
-        text(6,164,"LEFT or RIGHT - walk one",C_DIM,1);
-        text(6,178,"way; warmer = correct",C_DIM,1);
+        text(6,146,q,C_OK,2);
+        text(6,172,"off your walk direction",C_DIM,1);
+        text(6,186,"LEFT/RIGHT - walk one way",C_DIM,1);
         if(tri_quality >= 0){
             snprintf(q,sizeof q,"AP residual %.1f m %s",(double)tri_quality,
                      tri_quality<4.0f?"(good)":"(weak)");
-            text(6,196,q, tri_quality<4.0f?C_OK:C_ACC,1);
+            text(6,188,q, tri_quality<4.0f?C_OK:C_ACC,1);
+        }
+        { int ok=0; for(int i=0;i<res_n;i++) if(res_ap[i].ok) ok++;
+          snprintf(q,sizeof q,"APs placed %d/%d",ok,res_n);
+          text(6,202,q, ok ? C_OK : C_DIM, 1);
         }
     }
-    text(6,H-15,"A: capture   B: reset",C_DIM,1);
+    text(6,H-15,"A: next capture  DOWN: refresh  B: reset",C_DIM,1);
 }
 
 static void (*PAGEFN[3])(void) = { draw_list, draw_find, draw_tri };
@@ -1013,6 +1254,19 @@ static void leds_tick(int t){
 // stalls, the UI, radio and buttons carry on regardless.
 static void log_task(void *arg){
     for(;;){
+        {   // report the channel we are ACTUALLY on, not the one we asked for
+            uint8_t ch = 0; wifi_second_chan_t sec;
+            esp_wifi_get_channel(&ch, &sec);
+            wifi_config_t ac; esp_wifi_get_config(WIFI_IF_AP, &ac);
+            printf("NOW ch=%d apch=%d pin_rc=%d | req_tx=%d(rc%d) req_rx=%d "
+                   "resp_tx=%d(rc%d) resp_rx=%d peerAP=%d espnow_pkts=%d\n",
+                   ch, ac.ap.channel, pin_rc,
+                   n_req_tx, rc_req_tx, n_req_rx, n_resp_tx, rc_resp_tx,
+                   n_resp_rx, peer_nap, now_pkts);
+            printf("    peer_known=%d add_rc=%d mac=%02x:%02x:%02x:%02x:%02x:%02x\n",
+                   peer_known, peer_add_rc, peer_mac[0],peer_mac[1],peer_mac[2],
+                   peer_mac[3],peer_mac[4],peer_mac[5]);
+        }
         if(tri_stage)
             printf("TRI stage=%d walk=%.1f steps=%d dAB=(%.1f,%.1f) "
                    "peerAP=%d common=%d ang=%.0f resid=%.1f\n",
@@ -1024,11 +1278,11 @@ static void log_task(void *arg){
                    (char*)target.ssid, now_fresh()?"espnow":"beacon",
                    (double)rssi_f, trend_txt, (double)rssi_to_m(rssi_f),
                    (unsigned long)ftm_cm, (double)spin_span);
-        else if(0) {}
-        else
+        else {
             printf("idle: %d APs | BLE init=%d sync=%d adv=%d disc=%d seen=%d peer=%s %d\n",
                    nap, ble_init_rc, ble_synced, ble_adv_rc, ble_disc_rc,
                    ble_seen_any, ble_fresh()?"yes":"no", (int)ble_f);
+        }
         vTaskDelay(pdMS_TO_TICKS(2000));
     }
 }
@@ -1048,6 +1302,13 @@ void app_main(void){
     display_init();
     page_draw = draw_list;
     wifi_up();
+    // Empirically ESP-NOW broadcast is only RECEIVED while promiscuous mode is
+    // enabled: with it off, every heartbeat was transmitted (rc0) and none
+    // arrived, on the same channel. Turn it on at boot and leave it on.
+    {   wifi_promiscuous_filter_t f = { .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT };
+        esp_wifi_set_promiscuous_filter(&f);
+        esp_wifi_set_promiscuous_rx_cb(promisc_cb);
+        esp_wifi_set_promiscuous(true); }
     ble_init();
     esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_FTM_REPORT, ftm_evt, NULL);
     do_scan();
@@ -1065,6 +1326,9 @@ void app_main(void){
             if((edge&(1u<<BTN_A)) && nap){ lock_target(); page=1; }
         } else if(page==2){
             if(edge&(1u<<BTN_A)) tri_capture();
+            // DOWN re-captures point 1 in place, so the map can be refreshed
+            // without advancing the state machine
+            if(edge&(1u<<BTN_DOWN)){ tri_stage = 0; tri_capture(); }
             if(edge&(1u<<BTN_B)){ tri_stage=0; tri_angle=-1; tri_quality=-1;
                                   tri_walk=0; tri_steps=0; tri_common=0;
                                   tri_msg="A: capture point 1"; }
@@ -1081,10 +1345,17 @@ void app_main(void){
         // plain APs that cannot talk back.
         int src = now_fresh() ? now_rssi : rssi_raw;
 
+        // Heartbeat: exchange scans automatically every 5 s regardless of page
+        // or button presses. Isolates the ESP-NOW transport from the UI so we
+        // can see whether the messages ever get through at all.
+        if((t % 250) == 249) send_scan_req();
+
         if(scan_req_pending){
             scan_req_pending = false;
             esp_wifi_set_promiscuous(false);
             do_scan();
+            pin_channel();
+            vTaskDelay(pdMS_TO_TICKS(120));
             send_scan_resp();
             wifi_promiscuous_filter_t f = { .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT };
             esp_wifi_set_promiscuous_filter(&f);
@@ -1134,9 +1405,10 @@ void app_main(void){
                 rssi_pkts = 0; now_pkts = 0;
             }
         }
-        // auto-rescan on the target list: keeps peers fresh as they move,
-        // and makes the badge observable over serial without a button press
-        if(page==0 && (t % 400) == 399) do_scan();
+        // NO auto-rescan. A scan sweeps all 13 channels for ~2 s, and ESP-NOW
+        // only works while both badges sit on the same one -- so a periodic
+        // background scan silently destroys the peer link. Scans happen only
+        // on explicit user action (B on the target list, or a capture).
 
         // our own ranging beacon for the peer to measure
         if(page==1){ uint8_t ping[4] = {'F','N','D',(uint8_t)t};
