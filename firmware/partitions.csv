@@ -1,0 +1,8 @@
+# Name,     Type, SubType,  Offset,    Size
+# EXACT copy of the stock table, read from a flash dump at 0x8000.
+# Keeping this identical is what preserves nvs (provisioning) and the
+# LittleFS storage partition (contacts, sponsors, solana.json) across a flash.
+nvs,        data, nvs,      0x9000,    16K
+phy_init,   data, phy,      0xd000,    4K
+factory,    app,  factory,  0x10000,   2688K
+storage,    data, littlefs, 0x2b0000,  1280K

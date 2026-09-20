@@ -1,0 +1,123 @@
+# Firmware notes — things that cost us time
+
+Working notes from bringing up custom firmware on the ESP32-C3 badge. All of
+these were found the hard way.
+
+## Toolchain
+
+Four traps, none of them in the official guide:
+
+1. **`export.sh` does not put the compiler on PATH** in a non-interactive
+   shell. It prints "Done! You can now compile ESP-IDF projects" and exits 0,
+   but `which riscv32-esp-elf-gcc` still fails. Add
+   `~/.espressif/tools/riscv32-esp-elf/*/riscv32-esp-elf/bin` manually.
+2. **`install.sh esp32c3` does not install cmake or ninja.** `brew install
+   cmake ninja` — cmake 4.4.3 works fine with IDF v5.5.3.
+3. **A failed configure poisons `build/`.** After fixing PATH the build still
+   claimed the compiler was missing, because `CMakeCache.txt` had cached the
+   old environment. `rm -rf build sdkconfig` and re-run `set-target`.
+4. **IDF builds with `-Werror`.** Two `if` statements on one line fails
+   `-Werror=misleading-indentation`. This will bite repeatedly.
+
+Component APIs also drift by version — check the header in
+`managed_components/` rather than trusting a doc example. `led_strip` uses
+`.led_pixel_format` in some versions and `.color_component_format` in others.
+
+## Reset handling
+
+| Goal | What works |
+|---|---|
+| Download mode, stock firmware running | **Physical only** — hold Start while plugging in USB |
+| Download mode, custom firmware running | `esptool --before usb-reset` |
+| Boot the app after flashing | **`esptool --after watchdog-reset`** |
+
+`--after hard-reset` prints `Hard resetting via RTS pin...`, exits 0, and does
+nothing — RTS is not wired to EN on this board. The badge is left silent in
+the bootloader, which looks exactly like a failed flash. This one is worth
+remembering.
+
+Together, `--before usb-reset` + `--after watchdog-reset` give a fully
+software-driven edit/build/flash/run loop once custom firmware is on the badge.
+Only the very first entry into download mode needs hands.
+
+## ST7789 display
+
+Two traps that produce output looking like a hardware fault but are pure
+software:
+
+**RGB565 byte order.** The panel takes each pixel MSB-first, so a
+little-endian `uint16_t` goes out byte-reversed. The giveaway: near-white
+renders *cyan*. Pre-swap at colour construction:
+
+```c
+#define RGB(r,g,b) ((uint16_t)__builtin_bswap16(\
+    (uint16_t)((((r)&0xF8)<<8)|(((g)&0xFC)<<3)|((b)>>3))))
+```
+
+**`esp_lcd_panel_draw_bitmap` is asynchronous.** It queues the DMA transfer and
+returns before the hardware reads your buffer. With a single shared stripe
+buffer, a pending transfer paints whatever the *next* stripe already wrote —
+on screen, bands render at the wrong height and content appears twice. Register
+`on_color_trans_done` and block on a semaphore before touching the buffer:
+
+```c
+esp_lcd_panel_io_callbacks_t cbs = { .on_color_trans_done = on_blit_done };
+esp_lcd_panel_io_register_event_callbacks(io, &cbs, NULL);
+// after every draw_bitmap:
+xSemaphoreTake(blit_done, pdMS_TO_TICKS(200));
+```
+
+The callback runs in ISR context: `IRAM_ATTR` and `xSemaphoreGiveFromISR`.
+
+**Rendering without LVGL.** A full 320x240x2 framebuffer is 150 KB, which does
+not sit comfortably beside the WiFi driver on a 400 KB part. We use one
+320x48 DMA buffer (30 KB) reused five times per frame, with draw calls clipped
+to the active stripe, and a 5x7 bitmap font. Avoids a dependency whose API had
+already shifted under us once.
+
+## Accelerometer axis is mirrored
+
+The panel init includes `esp_lcd_panel_mirror(true, false)`, which mirrors X.
+The accelerometer is not mirrored, so **sensor +X is screen −X** — tilt right
+and the dot goes left. Keep raw values raw and convert at the point of use.
+Y needs no flip.
+
+Front-face LED order is **0 UpperLeft, 1 UpperRight, 2 MiddleRight,
+3 BottomRight, 4 BottomLeft, 5 MiddleLeft** — so a pure "right" cue is index
+**2**, not 3.
+
+## USB-Serial-JTAG console
+
+**`printf` blocks when the buffer fills and no host is draining it.** On USB
+this never shows up because the host reads continuously; on battery the main
+loop freezes solid and the display stops updating. It looks like a crash.
+
+Do not try to reduce log volume — move all logging to a **separate
+low-priority FreeRTOS task**. If it stalls, the UI, radio and buttons carry on.
+
+Also: **the first ~1.6 s of boot output is always lost**, because the CDC
+endpoint only enumerates after reset. Anything printed once at startup never
+reaches the terminal. Print status on a loop, or stash it in a global and
+report it later.
+
+## Floating point is catastrophic
+
+The ESP32-C3 has **no FPU**. A soft-float multiply-add costs ~240 cycles and
+`expf` ~3400. In any hot loop, budget in integer ops and treat every
+`expf`/`logf` as a ~3400-cycle event. Converting one inner loop from float to
+fixed-point integer arithmetic gained close to 10x on a numeric workload.
+
+## Flashing does not erase badge data
+
+Keep the partition table byte-identical to stock and the flash writes only
+`0x0`, `0x8000` and `0x10000`. `nvs` at `0x9000` and the LittleFS `storage`
+partition are never touched, so provisioning and saved state survive. Verified
+by reading the flash back and diffing the storage partition byte-for-byte.
+
+What *does* destroy data is `erase_flash`, or a partition table that relocates
+`storage` — a default Arduino/OTA layout will do exactly that. Read the real
+table out of a flash dump rather than inferring it.
+
+One caveat: any firmware that brings up WiFi writes RF calibration data to
+`nvs`, so a backup taken afterwards differs from one taken before. Provisioning
+survives either way.
