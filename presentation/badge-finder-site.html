@@ -204,6 +204,47 @@ html.js .slide.live .fx:nth-child(4){transition-delay:.24s;}
    intentionally does not disable motion under prefers-reduced-motion. */
 a{color:var(--blue);}
 :focus-visible{outline:2px solid var(--blue); outline-offset:3px;}
+
+/* ---- print / PDF export (Ctrl-P, or ?print for headless capture) ----
+   The live deck has ONE travelling canvas, so print mode lays the slides
+   out as pages and draws each slide's phase into its own static canvas. */
+@page{ size:13.333in 7.5in; margin:0; }
+html.printmode, html.printmode body{
+  overflow:visible; height:auto;
+  -webkit-print-color-adjust:exact; print-color-adjust:exact;
+}
+html.printmode #deck{transform:none !important; transition:none !important;}
+html.printmode section.slide{
+  width:13.333in; height:7.5in; min-height:0; overflow:hidden;
+  opacity:1 !important; transition:none !important;
+  break-after:page; page-break-after:always;
+  padding:.45in .6in; box-sizing:border-box;
+  display:flex; flex-direction:column; align-items:center; justify-content:center;
+}
+html.printmode .inner{width:100%; margin:0;}
+html.printmode .split{grid-template-columns:1fr 1fr; align-items:center;}
+html.printmode .slot{height:3.6in; aspect-ratio:auto; width:100%;}
+html.printmode .hero-slot{
+  position:absolute; left:50%; top:50%; transform:translate(-50%,-50%);
+  width:9in; height:5.6in;
+}
+html.printmode #s0 .hero-fg{
+  position:absolute; left:50%; top:50%; transform:translate(-50%,-50%); width:86%;
+}
+html.printmode .hero-title{font-size:6rem; margin-bottom:1rem;}
+html.printmode .giant{font-size:6rem;}
+html.printmode h2{font-size:2.6rem;}
+html.printmode .lead{font-size:1.35rem;}
+html.printmode .punch{font-size:1.6rem;}
+html.printmode figcaption{font-size:.95rem;}
+html.printmode section.slide:last-child{break-after:auto; page-break-after:auto;}
+html.printmode section.slide::before{opacity:1;}
+html.printmode .fx{opacity:1 !important; transform:none !important; transition:none !important;}
+html.printmode nav.rail, html.printmode .hud, html.printmode .navbtns,
+html.printmode #progress, html.printmode .cue, html.printmode #stage{display:none !important;}
+html.printmode .slot{position:relative;}
+html.printmode .slot > canvas{display:block; width:100%; height:100%;}
+html.printmode .hero-slot > canvas{opacity:.42;}
 </style>
 <script>document.documentElement.classList.add("js","deckmode");</script>
 
@@ -869,6 +910,39 @@ addEventListener("keydown",e=>{
 document.getElementById("btnDown").addEventListener("click",()=>go(current+1));
 document.getElementById("btnUp").addEventListener("click",()=>go(current-1));
 
+/* ---------- print / PDF export ---------- */
+function preparePrint(){
+  const html=document.documentElement;
+  if(html.classList.contains("printmode")) return;
+  html.classList.remove("deckmode");
+  html.classList.add("printmode");
+  slides.forEach((s,i)=>{
+    const slot=s.querySelector(".slot"); if(!slot) return;
+    let cv=slot.querySelector("canvas");
+    if(!cv){ cv=document.createElement("canvas"); slot.appendChild(cv); }
+    const r=slot.getBoundingClientRect(), dpr=2;
+    cv.width=Math.max(4,Math.round(r.width*dpr));
+    cv.height=Math.max(4,Math.round(r.height*dpr));
+    /* derive the view from the canvas's real shape so nothing is stretched */
+    const ph=PHASES[SLIDE_PHASE[i]], cam=ph.cam, hh=cam[2]*(cv.height/cv.width);
+    ph.draw(kit(cv.getContext("2d"),
+      [cam[0]-cam[2],cam[0]+cam[2],cam[1]-hh,cam[1]+hh],
+      cv.width,cv.height), 1, performance.now());
+  });
+  sizeCrowd(); renderCrowd(1);
+}
+function restoreFromPrint(){
+  const html=document.documentElement;
+  if(!html.classList.contains("printmode")) return;
+  html.classList.remove("printmode");
+  html.classList.add("deckmode");
+  slides.forEach(s=>{ const c=s.querySelector(".slot > canvas"); if(c) c.remove(); });
+  sizeCrowd(); renderCrowd(1);
+  setTransform(true); moveStage(current,true);
+}
+addEventListener("beforeprint",preparePrint);
+addEventListener("afterprint",restoreFromPrint);
+
 /* ---------- init ---------- */
 sizeCrowd(); renderCrowd(1);
 setTransform(true);
@@ -879,5 +953,6 @@ bufferStage(r0);
 activate(0);
 moveStage(0,true);
 requestAnimationFrame(loop);
+if(location.search.includes("print")) requestAnimationFrame(()=>preparePrint());
 })();
 </script>
