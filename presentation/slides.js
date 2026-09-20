@@ -285,7 +285,7 @@ function title(s, text, opts = {}) {
   ], { x: 0.7, y: 4.5, w: 11.9, h: 0.9, isTextBox: true, margin: 0, fontFace: "Arial", fontSize: 17 });
   s.addText([
     { text: "B scans the same APs and sends its list back over ESP-NOW. ", options: { color: INK } },
-    { text: "8 APs × (6 B BSSID + 1 B RSSI) = 56 bytes — one packet.", options: { color: MUTED } },
+    { text: "16 APs × (6 B BSSID + 1 B RSSI) = 114 bytes — one packet.", options: { color: MUTED } },
   ], { x: 0.7, y: 5.5, w: 11.9, h: 0.9, isTextBox: true, margin: 0, fontFace: "Arial", fontSize: 17 });
 }
 
@@ -383,9 +383,15 @@ function title(s, text, opts = {}) {
     { text: "The chord midpoints pin the axis A should move along — the A–B line is known. ", options: { color: INK } },
     { text: "But both directions along it fit the data equally well: ", options: { color: INK } },
     { text: "toward B, or exactly away from it.", options: { color: CORAL, bold: true } },
-  ], { x: 8.0, y: 2.2, w: 4.63, h: 2.3, isTextBox: true, margin: 0, fontFace: "Arial", fontSize: 16 });
-  s.addText("Stage 1 alone cannot tell you which of the two ways to walk.", {
-    x: 8.0, y: 4.7, w: 4.63, h: 1.4, isTextBox: true, margin: 0,
+  ], { x: 8.0, y: 2.1, w: 4.63, h: 1.9, isTextBox: true, margin: 0, fontFace: "Arial", fontSize: 16 });
+  s.addText([
+    { text: "Found while implementing: ", options: { color: CORAL, bold: true } },
+    { text: "mirror B and every AP across the walk axis and every range is unchanged. It is a ", options: { color: INK } },
+    { text: "symmetry of the data", options: { color: INK, bold: true } },
+    { text: " — more APs cannot break it.", options: { color: INK } },
+  ], { x: 8.0, y: 4.05, w: 4.63, h: 1.8, isTextBox: true, margin: 0, fontFace: "Arial", fontSize: 15 });
+  s.addText("Ranges alone can never choose a side.", {
+    x: 8.0, y: 5.85, w: 4.63, h: 0.9, isTextBox: true, margin: 0,
     fontFace: "Arial", fontSize: 19, bold: true, color: INK,
   });
 }
@@ -418,18 +424,17 @@ function title(s, text, opts = {}) {
   seg(s, a2x, a2y, bx, by, GREEN, 2.5, "solid", true);
 
   const bl = [
-    ["Steps count the displacement — ≈0.72 m each", INK],
+    ["Screen prompts WALK ~5 STEPS; the accelerometer accumulates the baseline s", INK],
     ["Direction is “straight ahead” in your own body frame — a direction you can feel", INK],
-    ["Re-scan from A₂: only one candidate in each mirror pair fits the new distances", INK],
-    ["Three anchors — A₁, B, A₂ — kill the reflection and pin the map to your walk", INK],
+    ["A₂ re-captures: ranges to B and a fresh AP scan", INK],
+    ["Solve, then score: each common AP's predicted range to the solved B is compared with what B reported", INK],
   ];
   bl.forEach((p, i) => {
     s.addText(p[0], { x: 8.0, y: 2.1 + i * 0.95, w: 4.63, h: 0.9, isTextBox: true, margin: 0, fontFace: "Arial", fontSize: 14.5, color: p[1], bullet: { code: "25AA", indent: 12 } });
   });
-  s.addText("θ = arccos(−Δd / Δwalked)   keeps the compass live while you walk", {
-    x: 0.7, y: 6.65, w: 11.9, h: 0.4, isTextBox: true, margin: 0,
-    fontFace: "Courier New", fontSize: 14, color: GREEN,
-  });
+  s.addText("x = (d₁² − d₂² + s²) / 2s        θ = atan2(√(d₁² − x²), x)        walk direction = +x",
+    { x: 0.7, y: 6.6, w: 11.9, h: 0.45, isTextBox: true, margin: 0,
+      fontFace: "Courier New", fontSize: 14, color: GREEN });
 }
 
 // =========================================================
@@ -441,9 +446,9 @@ function title(s, text, opts = {}) {
   title(s, "Why this beats spinning in place");
 
   const stats = [
-    ["±29° → ±15–25°", "expected bearing error, vs a single body-shadow spin", GREEN],
-    ["1 → 5–8", "constraints per capture — over-determined, robust to any one bad AP", BLUE],
-    ["56 bytes", "of data exchanged — one ESP-NOW packet", CORAL],
+    ["±29° → ±15–25°", "predicted bearing error vs a single spin — ground-truth run still pending", GREEN],
+    ["114 bytes", "16 APs in one ESP-NOW packet", CORAL],
+    ["< 4 m", "mean AP residual on the badge ⇒ the geometry is consistent", BLUE],
   ];
   stats.forEach((st, i) => {
     const x = 0.7 + i * 4.12;
@@ -453,8 +458,10 @@ function title(s, text, opts = {}) {
   });
 
   s.addText([
-    { text: "Multipath errors on different APs are largely independent — they average out. ", options: { color: INK } },
-    { text: "RSSI→distance is still the weak link (factor-of-two typical): the rings are thick annuli, not thin circles.", options: { color: MUTED } },
+    { text: "Running on both badges — the TRIANGULATE page. ", options: { color: INK, bold: true } },
+    { text: "Whether it beats the closing-rate compass already running is ", options: { color: INK } },
+    { text: "not measured yet", options: { color: CORAL, bold: true } },
+    { text: " — that is the next test, and the honest caveat.", options: { color: INK } },
   ], { x: 0.7, y: 4.85, w: 11.9, h: 0.8, isTextBox: true, margin: 0, fontFace: "Arial", fontSize: 15.5 });
   s.addText([
     { text: "And the endgame: APs are static. ", options: { color: INK, bold: true } },
@@ -489,7 +496,8 @@ function title(s, text, opts = {}) {
   s.addText([
     { text: "No bodies in the way — a person between the badges soaks up 10–20 dB and reads as extra distance", options: { bullet: { code: "25AA", indent: 14 }, breakLine: true } },
     { text: "Not too much obstruction between them — walls and dense crowd stretch every apparent range", options: { bullet: { code: "25AA", indent: 14 }, breakLine: true } },
-    { text: "This is a hallway-scale finder, not an AirTag — and it says so honestly", options: { bullet: { code: "25AA", indent: 14 } } },
+    { text: "You walk roughly straight — a curved walk breaks the baseline", options: { bullet: { code: "25AA", indent: 14 }, breakLine: true } },
+    { text: "Hallway-scale, not an AirTag — the screen says “LEFT or RIGHT: walk one way, warmer = correct”", options: { bullet: { code: "25AA", indent: 14 } } },
   ], { x: 7.3, y: cardY + 0.9, w: 5.0, h: 3.2, isTextBox: true, margin: 0, fontFace: "Arial", fontSize: 15, color: INK, paraSpaceAfter: 14 });
 
   s.addText([
@@ -529,7 +537,7 @@ function title(s, text, opts = {}) {
     x: 1.5, y: 2.55, w: 10.33, h: 1.6, isTextBox: true, margin: 0,
     fontFace: "Arial", fontSize: 72, bold: true, color: INK, align: "center",
   });
-  s.addText("Hack the North 2026 badge · custom ESP-IDF firmware · ±17° with three spins averaged", {
+  s.addText("Hack the North 2026 badge · custom ESP-IDF firmware · TRIANGULATE page, live on two badges", {
     x: 1.5, y: 6.55, w: 10.33, h: 0.4, isTextBox: true, margin: 0,
     fontFace: "Arial", fontSize: 13, color: MUTED, align: "center",
   });

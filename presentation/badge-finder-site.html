@@ -215,7 +215,8 @@ a{color:var(--blue);}
     <p class="eyebrow fx">Hack the North 2026 · custom ESP32-C3 firmware</p>
     <h1 class="fx hero-title">Badge Finder</h1>
     <p class="lead fx" style="margin-inline:auto; max-width:none; font-size:clamp(1.4rem,2.6vw,2rem)">
-    Finding a friend with borrowed WiFi — <span class="b">no compass, no gyro</span>.</p>
+    Finding a friend with borrowed WiFi — <span class="b">no compass, no gyro</span>.
+    <span class="green">Running on hardware.</span></p>
   </div>
   <div class="cue" aria-hidden="true">↓</div>
 </section>
@@ -300,7 +301,7 @@ a{color:var(--blue);}
     </div>
     <figure>
       <div class="slot"></div>
-      <figcaption class="fx">A measures each AP; B does the same and replies over ESP-NOW (56 bytes)</figcaption>
+      <figcaption class="fx">A measures each AP; B does the same and replies over ESP-NOW (16 APs, 114 bytes)</figcaption>
     </figure>
   </div>
 </section>
@@ -363,7 +364,10 @@ y = ±√(dA² − x²)</code>
     </figure>
     <p class="lead fx"><span class="coral">Both directions fit the data</span> —
     toward B, or exactly away.</p>
-    <p class="punch fx">Stage 1 can't tell you which way to walk.</p>
+    <p class="lead fx dim">Worse: mirror B and every AP across the walk axis and
+    <span class="b" style="color:var(--ink)">every range is identical</span>.
+    It's a symmetry of the data — more APs can't fix it.</p>
+    <p class="punch fx">Ranges alone can't choose a side.</p>
   </div>
 </section>
 
@@ -379,10 +383,12 @@ y = ±√(dA² − x²)</code>
       <h2 class="fx">Walk a few steps, measure again</h2>
       <p class="lead fx">Steps count the metres. Direction =
       <span class="b">“straight ahead”</span> — you can feel it.</p>
-      <p class="lead fx">Re-scan from A₂: <span class="b">one candidate per pair survives</span>.</p>
+      <p class="lead fx">Re-scan from A₂ solves B — <span class="b">up to a mirror</span>.
+      Ranges are mirror-blind: <span class="coral">the spin (or “warmer”) picks the side.</span></p>
       <div class="eq fx">
-        <div class="h">and while you keep walking, the compass stays live:</div>
-        <code>θ = arccos(−Δd / Δwalked)</code>
+        <div class="h">the on-badge solver (walk direction = +x):</div>
+        <code>x = (d₁² − d₂² + s²) / 2s
+θ = atan2(√(d₁² − x²), x)</code>
       </div>
     </div>
   </div>
@@ -394,11 +400,13 @@ y = ±√(dA² − x²)</code>
     <p class="eyebrow fx">Honest numbers</p>
     <h2 class="fx">Why this beats spinning in place</h2>
     <div class="stats fx">
-      <div class="stat"><div class="n green">±29° → ±15–25°</div><div class="s">expected bearing error, vs a single body-shadow spin</div></div>
-      <div class="stat"><div class="n blue">1 → 5–8</div><div class="s">constraints per capture — over-determined, robust to any one bad AP</div></div>
-      <div class="stat"><div class="n coral">56 bytes</div><div class="s">of data exchanged — one ESP-NOW packet</div></div>
+      <div class="stat"><div class="n green">±29° → ±15–25°</div><div class="s">predicted, vs a single body-shadow spin — ground-truth run pending</div></div>
+      <div class="stat"><div class="n coral">114 bytes</div><div class="s">16 APs in one ESP-NOW packet</div></div>
+      <div class="stat"><div class="n blue">&lt; 4 m</div><div class="s">mean AP residual on the badge ⇒ the geometry is consistent</div></div>
     </div>
-    <p class="lead fx" style="margin-top:2rem">Multipath errors average out across APs.</p>
+    <p class="lead fx" style="margin-top:2rem"><span class="b">Running on both badges</span> —
+    the TRIANGULATE page. Accuracy vs the closing-rate compass:
+    <span class="coral">not measured yet</span>. That's the next test.</p>
     <p class="lead fx"><span class="b">APs are static</span> →
     <span class="green">cache the map → one-scan locates.</span></p>
   </div>
@@ -424,7 +432,8 @@ y = ±√(dA² − x²)</code>
         <ul>
           <li>No bodies blocking — a person costs 10–20 dB</li>
           <li>Only light obstruction between badges</li>
-          <li>Hallway-scale, not an AirTag</li>
+          <li>You walk roughly straight</li>
+          <li>Hallway-scale, not an AirTag — the screen says “LEFT or RIGHT: walk one way, warmer = correct”</li>
         </ul>
       </div>
     </div>
@@ -446,7 +455,7 @@ y = ±√(dA² − x²)</code>
 <section class="slide" id="s13" data-name="Questions">
   <div class="inner center">
     <h2 class="giant fx" style="font-size:clamp(3rem,10vw,7rem)">Questions?</h2>
-    <p class="sub fx" style="margin-top:2.5rem">Hack the North 2026 badge · custom ESP-IDF firmware · ±17° with three spins averaged</p>
+    <p class="sub fx" style="margin-top:2.5rem">Hack the North 2026 badge · custom ESP-IDF firmware · TRIANGULATE page, live on two badges</p>
   </div>
 </section>
 
