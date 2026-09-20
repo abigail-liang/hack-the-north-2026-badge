@@ -280,9 +280,9 @@ html.printmode .hero-slot > canvas{opacity:.42;}
       <p class="eyebrow fx">The scenario</p>
       <h2 class="fx">You're trying to find your friend at Hack&nbsp;the&nbsp;North.</h2>
       <div class="stats fx">
-        <div class="stat"><div class="n coral">1,000+</div><div class="s">hackers in one building</div></div>
-        <div class="stat"><div class="n coral">0 bars</div><div class="s">of cell signal in the hall</div></div>
-        <div class="stat wide"><div class="n coral">“by the tables”</div><div class="s">describes every corner of the venue</div></div>
+        <div class="stat"><div class="n coral">1,000+</div><div class="s">hackers, one building</div></div>
+        <div class="stat"><div class="n coral">0 bars</div><div class="s">of signal inside</div></div>
+        <div class="stat wide"><div class="n coral">“by the tables”</div><div class="s">describes the entire venue</div></div>
       </div>
       <p class="punch fx" style="color:var(--green)">We flashed a custom firmware</p>
     </div>
@@ -302,20 +302,20 @@ html.printmode .hero-slot > canvas{opacity:.42;}
       <div class="card yes">
         <h3>What it has</h3>
         <ul>
-          <li>WiFi — full scan, ESP-NOW, SoftAP</li>
-          <li>802.11mc FTM — time-of-flight ranging</li>
-          <li>BLE — raw advertise + scan</li>
-          <li>Accelerometer — step counting</li>
-          <li>6 RGB LEDs + 320×240 display</li>
+          <li>WiFi scan, ESP-NOW, SoftAP</li>
+          <li>802.11mc FTM ranging</li>
+          <li>BLE advertise + scan</li>
+          <li>Accelerometer</li>
+          <li>6 RGB LEDs, 320×240 display</li>
         </ul>
       </div>
       <div class="card no">
         <h3>What it doesn't</h3>
         <ul>
-          <li>GPS <span class="why">— useless indoors anyway</span></li>
-          <li>Magnetometer <span class="why">— no compass</span></li>
-          <li>Gyroscope <span class="why">— can't track turning</span></li>
-          <li>UWB / AoA antennas <span class="why">— no AirTag tricks</span></li>
+          <li>GPS</li>
+          <li>Magnetometer</li>
+          <li>Gyroscope</li>
+          <li>UWB / AoA antennas</li>
         </ul>
       </div>
     </div>
@@ -328,14 +328,14 @@ html.printmode .hero-slot > canvas{opacity:.42;}
   <div class="inner split">
     <figure>
       <div class="slot"></div>
-      <figcaption class="fx">|AB| = 5.0 m — measured precisely, in every direction at once</figcaption>
+      <figcaption class="fx">5.0 m — in every direction at once</figcaption>
     </figure>
     <div>
       <p class="eyebrow fx">What we can measure</p>
       <h2 class="fx">A distance is only a ring</h2>
-      <p class="lead fx"><span class="blue">FTM</span> gives the distance to B</p>
-      <p class="lead fx">But it's only a radius.
-      <span class="coral">B is anywhere on the ring.</span></p>
+      <p class="lead fx"><span class="blue">FTM</span> gives the distance.</p>
+      <p class="lead fx">Only a radius —
+      <span class="coral">B is anywhere on it.</span></p>
       <p class="punch fx">We need a direction.</p>
     </div>
   </div>
@@ -347,13 +347,13 @@ html.printmode .hero-slot > canvas{opacity:.42;}
     <div>
       <p class="eyebrow fx">The key insight</p>
       <h2 class="fx">We are not alone in the room</h2>
-      <p class="lead fx">5–8 access points. They never move.
+      <p class="lead fx">5–8 APs. Never move.
       <span class="b">Both badges see them.</span></p>
       <p class="punch fx" style="color:var(--green)">Free, static reference points.</p>
     </div>
     <figure>
       <div class="slot"></div>
-      <figcaption class="fx">A measures each AP; B does the same and replies over ESP-NOW (16 APs, 114 bytes)</figcaption>
+      <figcaption class="fx">B replies over ESP-NOW — 114 bytes</figcaption>
     </figure>
   </div>
 </section>
@@ -363,15 +363,15 @@ html.printmode .hero-slot > canvas{opacity:.42;}
   <div class="inner split">
     <figure>
       <div class="slot"></div>
-      <figcaption class="fx">one shared AP → one circle pair → two candidates</figcaption>
+      <figcaption class="fx">one AP → two candidates</figcaption>
     </figure>
     <div>
       <p class="eyebrow fx">Stage 1 · first capture</p>
       <h2 class="fx">Two circles, two answers</h2>
-      <p class="lead fx">RSSI → rough distances <span class="mono">dA</span>, <span class="mono">dB</span>.
-      The circles cross at <span class="b">two mirror points</span>.</p>
+      <p class="lead fx">RSSI → rough distances. The circles cross at
+      <span class="b">two mirror points</span>.</p>
       <div class="eq fx">
-        <div class="h">for each shared AP, with A at (0,0) and B at (d,0):</div>
+        <div class="h">per AP · A at (0,0), B at (d,0)</div>
         <code>x = (d² + dA² − dB²) / 2d
 y = ±√(dA² − x²)</code>
       </div>
@@ -385,14 +385,12 @@ y = ±√(dA² − x²)</code>
     <div>
       <p class="eyebrow fx">Stage 1 · geometry check</p>
       <h2 class="fx">The chords hand us the A–B line</h2>
-      <p class="lead fx">The chords are <span class="green">all parallel</span> —
-      90.00°, every time.</p>
-      <p class="lead fx">Their midpoints lie on one line:
+      <p class="lead fx">The chords are <span class="green">all parallel</span> — 90.00°.</p>
+      <p class="lead fx">Their midpoints give
       <span class="b">the A–B line</span>.</p>
     </div>
     <figure>
       <div class="slot"></div>
-      <figcaption class="fx">midpoints → the A–B line</figcaption>
     </figure>
   </div>
 </section>
@@ -405,8 +403,7 @@ y = ±√(dA² − x²)</code>
     <figure style="max-width:760px; margin-inline:auto">
       <div class="slot"></div>
     </figure>
-    <p class="lead fx" style="max-width:none"><span class="coral">Both directions fit the data</span> —
-    toward B, or exactly away.</p>
+    <p class="lead fx" style="max-width:none"><span class="coral">Both directions fit</span> — toward B, or away.</p>
   </div>
 </section>
 
@@ -415,17 +412,16 @@ y = ±√(dA² − x²)</code>
   <div class="inner split">
     <figure>
       <div class="slot"></div>
-      <figcaption class="fx">three anchors — A₁, B, A₂ — pin the map to your walk</figcaption>
+      <figcaption class="fx">A₁, B, A₂ pin the map to your walk</figcaption>
     </figure>
     <div>
       <p class="eyebrow fx">Stage 2 · second capture</p>
       <h2 class="fx">Walk a few steps, measure again</h2>
-      <p class="lead fx">Steps count the metres. Direction =
-      <span class="b">“straight ahead”</span></p>
-      <p class="lead fx">Re-scan from A₂ solves B — <span class="b">up to a mirror</span>.
-      Ranges are mirror-blind: <span class="coral">the spin (or “warmer”) picks the side.</span></p>
+      <p class="lead fx">Steps count the metres. Direction = <span class="b">straight ahead</span>.</p>
+      <p class="lead fx">Re-scan solves B — <span class="b">up to a mirror</span>.
+      <span class="coral">The spin picks the side.</span></p>
       <div class="eq fx">
-        <div class="h">the on-badge solver (walk direction = +x):</div>
+        <div class="h">on-badge solver · walk = +x</div>
         <code>x = (d₁² − d₂² + s²) / 2s
 θ = atan2(√(d₁² − x²), x)</code>
       </div>
@@ -454,18 +450,18 @@ y = ±√(dA² − x²)</code>
         <h3>The error</h3>
         <div class="stat" style="border:none; padding:0; background:transparent">
           <div class="n coral" style="font-size:clamp(2rem,4vw,3rem)">30–50%</div>
-          <div class="s">error in a single WiFi distance estimate</div>
+          <div class="s">per-scan WiFi distance error</div>
         </div>
-        <p class="lead" style="font-size:1.2rem; margin-top:1.2rem"><span class="green">The fix:
-        a rolling average.</span> The noise changes every scan — the truth doesn't.</p>
+        <p class="lead" style="font-size:1.2rem; margin-top:1.2rem"><span class="green">Fix: a rolling
+        average.</span> The noise moves; the truth doesn't.</p>
       </div>
       <div class="card yes">
         <h3 style="color:var(--blue)">The assumptions</h3>
         <ul>
-          <li>No bodies blocking — a person costs 10–20 dB</li>
-          <li>Only light obstruction between badges</li>
-          <li>You walk roughly straight</li>
-          <li>Hallway-scale, not an AirTag — the screen says “LEFT or RIGHT: walk one way, warmer = correct”</li>
+          <li>No bodies blocking (10–20 dB)</li>
+          <li>Light obstruction only</li>
+          <li>You walk straight</li>
+          <li>Left or right: walk one way — warmer wins</li>
         </ul>
       </div>
     </div>
@@ -476,7 +472,7 @@ y = ±√(dA² − x²)</code>
 <section class="slide" id="s13" data-name="Questions">
   <div class="inner center">
     <h2 class="giant fx" style="font-size:clamp(3rem,10vw,7rem)">Questions?</h2>
-    <p class="sub fx" style="margin-top:2.5rem">Hack the North 2026 badge · custom ESP-IDF firmware · TRIANGULATE page, live on two badges</p>
+    <p class="sub fx" style="margin-top:2.5rem">Hack the North 2026 · custom ESP-IDF firmware</p>
   </div>
 </section>
 
