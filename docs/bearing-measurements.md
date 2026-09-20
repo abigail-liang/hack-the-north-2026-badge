@@ -13,6 +13,8 @@ Ground truth came from spinning at known start orientations relative to a
 fixed peer badge (facing it, 90° off, 180° off, then facing it again as a
 repeatability check).
 
+![Bearing results on the badge](images/bearing-results.jpg)
+
 ## Estimator comparison
 
 All four run on the **same** 16-bin patterns, n = 8 spins:

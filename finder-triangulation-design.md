@@ -23,6 +23,9 @@ are free reference points.
 
 ### Stage 1 — first capture
 
+![Stage 1, first capture](docs/images/design-stage1-first-capture.jpg)
+
+
 1. A picks B as the target and sends B a "locate me" request (ESP-NOW).
 2. **A scans**: RSSI of every visible AP, plus range to B (FTM).
 3. **B scans** the same way and sends its AP list back to A.
@@ -38,6 +41,9 @@ and B itself has two possible bearings.
 
 ### Stage 2 — second capture
 
+![Stage 2, after second capture](docs/images/design-stage2-after-second-capture.jpg)
+
+
 6. Prompt the user to **walk a few steps in any direction**. Step count gives
    the displacement magnitude; the direction is "straight ahead" in the user's
    own body frame.
@@ -50,6 +56,10 @@ and B itself has two possible bearings.
 ---
 
 ## Geometry check: the parallel-chords hypothesis
+
+![Circle intersections give two candidate AP positions](docs/images/design-circle-intersection.jpg)
+
+![All chords parallel, perpendicular to AB](docs/images/design-parallel-chords.jpg)
 
 **Team hypothesis:** the lines joining each AP's two candidate positions are
 all parallel, and the direction to travel is perpendicular to them.

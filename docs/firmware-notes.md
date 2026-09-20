@@ -45,6 +45,8 @@ Only the very first entry into download mode needs hands.
 Two traps that produce output looking like a hardware fault but are pure
 software:
 
+![Byte-order bug: white renders cyan, plus torn bands](images/display-bug-byte-order.jpg)
+
 **RGB565 byte order.** The panel takes each pixel MSB-first, so a
 little-endian `uint16_t` goes out byte-reversed. The giveaway: near-white
 renders *cyan*. Pre-swap at colour construction:
@@ -53,6 +55,8 @@ renders *cyan*. Pre-swap at colour construction:
 #define RGB(r,g,b) ((uint16_t)__builtin_bswap16(\
     (uint16_t)((((r)&0xF8)<<8)|(((g)&0xFC)<<3)|((b)>>3))))
 ```
+
+![DMA race: noise instead of an image](images/display-bug-dma-race.jpg)
 
 **`esp_lcd_panel_draw_bitmap` is asynchronous.** It queues the DMA transfer and
 returns before the hardware reads your buffer. With a single shared stripe
