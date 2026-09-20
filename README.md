@@ -46,9 +46,7 @@ The badge has **no magnetometer and no gyro**, so we had to get creative:
 
 **Closing-rate compass:** Once walking, geometry alone gives the angle:
 
-\[
-\theta = \arccos\left(-\frac{\Delta \text{distance}}{\Delta \text{walked}}\right)
-\]
+$$\theta = \arccos\left(-\frac{\Delta\,\text{distance}}{\Delta\,\text{walked}}\right)$$
 
 Walk straight at the target and range drops 1 m per metre; walk perpendicular and it barely changes. Steps come from the accelerometer.
 
@@ -65,9 +63,7 @@ This gives an over-determined system (5–8 AP constraints instead of one), maki
 
 For the closing-rate method, the solver is straightforward trigonometry. For triangulation, we place A₁ at the origin, A₂ at `(s, 0)` where `s` is the walked baseline, and solve for B at the intersection of two circles:
 
-\[
-x = \frac{d_1^2 - d_2^2 + s^2}{2s}, \quad y = \sqrt{d_1^2 - x^2}, \quad \theta = \operatorname{atan2}(y, x)
-\]
+$$x = \frac{d_1^2 - d_2^2 + s^2}{2s}, \quad y = \sqrt{d_1^2 - x^2}, \quad \theta = \operatorname{atan2}(y, x)$$
 
 Inconsistent ranges from multipath are clamped to the nearest feasible point rather than failing. AP residuals (predicted vs. reported distance) give a quality metric—under ~4 m mean absolute residual, the geometry is consistent.
 
@@ -116,29 +112,6 @@ Inconsistent ranges from multipath are clamped to the nearest feasible point rat
 - **[Firmware notes](docs/firmware-notes.md)** — the traps that cost us time: toolchain, reset handling, display byte order, ESP-NOW channel pinning
 - **[Bearing measurements](docs/bearing-measurements.md)** — raw spin data
 - **[Presentation](presentation/)** — slides, narration and animation sources
-
-## Flashing safely
-
-Keep the partition table byte-identical to stock and flashing touches only the
-bootloader, partition table and app. `nvs` at `0x9000` and the LittleFS
-`storage` partition are never written, so provisioning, contacts and saved app
-state all survive. Verified by reading the flash back and diffing.
-
-```
-nvs,      data, nvs,      0x9000,   16K
-phy_init, data, phy,      0xd000,   4K
-factory,  app,  factory,  0x10000,  2688K
-storage,  data, littlefs, 0x2b0000, 1280K
-```
-
-Take a full backup first regardless:
-
-```bash
-esptool --chip esp32c3 -p /dev/cu.usbmodemXXXX read-flash 0 0x400000 badge-backup.bin
-```
-
-The badge help desk can restore stock firmware, but only a flash image restores
-your data.
 
 ---
 
